@@ -1,0 +1,32 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Checkpoints and large weights
+checkpoints/
+*.pth
+*.pt
+*.onnx
+
+# Datasets and raw data
+dataset/
+data/
+*.h5
+*.tif
+*.tiff
+*.nc
+
+# Environments
+.env
+.venv
+env/
+venv/
+
+# macOS
+.DS_Store
+
+# Logs and visual results
+results/
+runs/
+wandb/
