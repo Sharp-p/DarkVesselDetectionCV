@@ -155,15 +155,14 @@ class DarkVesselNet(nn.Module):
             ResidualBlock(128),
         )
 
-        # --- B. Geophysical Context Encoder (Channels 2 & 3: Bathymetry, Shore Distance) ---
-        self.context_stem = nn.Sequential(
-            ConvBlock(in_channels=2, out_channels=32, kernel_size=3, stride=2, padding=1),   # 256 -> 128
-            ConvBlock(in_channels=32, out_channels=64, kernel_size=3, stride=2, padding=1),  # 128 -> 64
-            ResidualBlock(64),
-        )
-
-        # --- C. CGCAM Novelty Module ---
+        # --- B/C. Context Encoder and CGCAM (Proposed Model Only) ---
+        # Baselines contain no unused context parameters or BatchNorm updates.
         if self.use_cgcam:
+            self.context_stem = nn.Sequential(
+                ConvBlock(2, 32, stride=2),   # 256 -> 128
+                ConvBlock(32, 64, stride=2),  # 128 -> 64
+                ResidualBlock(64),
+            )
             self.cgcam = CGCAMModule(radar_channels=128, context_channels=64, latent_dim=64)
 
         # --- D. Decoder & Upsampling Neck (64x64 -> 256x256) ---
@@ -194,7 +193,6 @@ class DarkVesselNet(nn.Module):
         """
         # Split input into radar (0, 1) and geophysical context (2, 3)
         x_radar = x[:, 0:2, :, :]    # (B, 2, 256, 256) -> [VH_dB, VV_dB]
-        x_context = x[:, 2:4, :, :]  # (B, 2, 256, 256) -> [bathymetry, distance_to_shore]
 
         # 1. Extract radar features: (B, 128, 64, 64)
         f_r = self.radar_stem(x_radar)
@@ -202,11 +200,9 @@ class DarkVesselNet(nn.Module):
         f_r = self.radar_down(f_r)
         f_r = self.radar_stage2(f_r)
 
-        # 2. Extract context features: (B, 64, 64, 64)
-        f_c = self.context_stem(x_context)
-
-        # 3. Apply CGCAM if enabled (Ablation toggle)
+        # 2/3. Extract context and cross-attend only in the proposed model.
         if self.use_cgcam:
+            f_c = self.context_stem(x[:, 2:4])
             f_out = self.cgcam(f_r, f_c)
         else:
             f_out = f_r
