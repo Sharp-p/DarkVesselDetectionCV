@@ -82,10 +82,7 @@ class CGCAMModule(nn.Module):
         self.value_proj = nn.Conv2d(radar_channels, latent_dim, kernel_size=1, bias=False)
 
         # Output projection back to radar feature channels
-        self.out_proj = nn.Sequential(
-            nn.Conv2d(latent_dim, radar_channels, kernel_size=1, bias=False),
-            nn.BatchNorm2d(radar_channels),
-        )
+        self.out_proj = nn.Conv2d(latent_dim, radar_channels, kernel_size=1, bias=False)
 
         # Learnable residual gating scalar, initialized to 0.0 for stable warm-start
         self.gamma = nn.Parameter(torch.zeros(1))
