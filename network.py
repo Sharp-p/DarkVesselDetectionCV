@@ -209,7 +209,7 @@ class DarkVesselNet(nn.Module):
         )
 
         # Bias initialization for focal loss stability: init bias to -2.19 (prob ~ 0.1)
-        self.heatmap_head[-1].bias.data.fill_(-2.19)
+        nn.init.constant_(self.heatmap_head[-1].bias, -2.19)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -248,7 +248,9 @@ class DarkVesselNet(nn.Module):
 
         # 5. Compute raw logits and apply sigmoid
         logits = self.heatmap_head(d2)  # (B, 2, 256, 256)
-        heatmap = torch.sigmoid(logits)
+        # Keep the probability clamp representable under fp16 autocast, where
+        # 1 - 1e-4 would otherwise round to 1 and permit log(0) in focal loss.
+        heatmap = torch.sigmoid(logits.float())
 
         # Numerical clamping to prevent log(0) in Focal Loss
         heatmap = torch.clamp(heatmap, min=1e-4, max=1.0 - 1e-4)
