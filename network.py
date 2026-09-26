@@ -135,14 +135,24 @@ class DarkVesselNet(nn.Module):
         - Channel 0: Mobile Vessel Centroid Gaussian peaks in [0.0, 1.0]
         - Channel 1: Fixed Offshore Structure Centroid Gaussian peaks in [0.0, 1.0]
     """
-    def __init__(self, use_cgcam: bool = USE_CGCAM, num_classes: int = NUM_CLASSES):
+    def __init__(
+        self,
+        use_cgcam: bool = USE_CGCAM,
+        num_classes: int = NUM_CLASSES,
+        *,
+        early_fusion: bool = False,
+    ):
         super().__init__()
+        if use_cgcam and early_fusion:
+            raise ValueError("Choose CGCAM or early fusion, not both.")
         self.use_cgcam = use_cgcam
+        self.early_fusion = early_fusion
         self.num_classes = num_classes
 
         # --- A. Radar Backbone (Channels 0 & 1: VH, VV) ---
         self.radar_stem = nn.Sequential(
-            ConvBlock(in_channels=2, out_channels=32, kernel_size=3, stride=1, padding=1),
+            ConvBlock(in_channels=INPUT_CHANNELS if early_fusion else 2, out_channels=32,
+                      kernel_size=3, stride=1, padding=1),
             ConvBlock(in_channels=32, out_channels=64, kernel_size=3, stride=2, padding=1),  # 256 -> 128
         )
         self.radar_stage1 = nn.Sequential(
@@ -191,8 +201,8 @@ class DarkVesselNet(nn.Module):
         Returns:
             heatmap: (B, 2, 256, 256) with values clamped in [1e-4, 1.0 - 1e-4]
         """
-        # Split input into radar (0, 1) and geophysical context (2, 3)
-        x_radar = x[:, 0:2, :, :]    # (B, 2, 256, 256) -> [VH_dB, VV_dB]
+        # Early fusion uses all four channels; other variants use radar here.
+        x_radar = x if self.early_fusion else x[:, :2]
 
         # 1. Extract radar features: (B, 128, 64, 64)
         f_r = self.radar_stem(x_radar)
