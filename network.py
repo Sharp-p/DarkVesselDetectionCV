@@ -73,6 +73,8 @@ class CGCAMModule(nn.Module):
     """
     def __init__(self, radar_channels: int = 128, context_channels: int = 64, latent_dim: int = 64):
         super().__init__()
+        if min(radar_channels, context_channels, latent_dim) <= 0:
+            raise ValueError("CGCAM channel counts and latent_dim must be positive.")
         self.latent_dim = latent_dim
         self.scale = 1.0 / math.sqrt(latent_dim)
 
@@ -95,13 +97,16 @@ class CGCAMModule(nn.Module):
         Returns:
             f_out: Context-modulated radar representation (B, C_r, H, W)
         """
-        B, C_r, H, W = f_r.shape
-        N = H * W
+        if f_r.ndim != 4 or f_c.ndim != 4:
+            raise ValueError("CGCAM expects two (B, C, H, W) feature maps.")
+        if f_r.shape[0] != f_c.shape[0] or f_r.shape[2:] != f_c.shape[2:]:
+            raise ValueError("Radar and context features must have matching batch and spatial dimensions.")
+        B, _, H, W = f_r.shape
 
-        # 1. Project into latent space: (B, d, H, W) -> (B, N, d)
-        q = self.query_proj(f_c).view(B, self.latent_dim, N).permute(0, 2, 1)  # (B, N, d)
-        k = self.key_proj(f_r).view(B, self.latent_dim, N)                     # (B, d, N)
-        v = self.value_proj(f_r).view(B, self.latent_dim, N).permute(0, 2, 1)  # (B, N, d)
+        # 1. Project into latent space: (B, d, H, W) -> (B, N, d), N = H * W
+        q = self.query_proj(f_c).flatten(2).transpose(1, 2)  # (B, N, d)
+        k = self.key_proj(f_r).flatten(2)                  # (B, d, N)
+        v = self.value_proj(f_r).flatten(2).transpose(1, 2)  # (B, N, d)
 
         # 2. Scaled Dot-Product Attention: (B, N, d) x (B, d, N) -> (B, N, N)
         attn_scores = torch.bmm(q, k) * self.scale
@@ -109,7 +114,7 @@ class CGCAMModule(nn.Module):
 
         # 3. Aggregate values: (B, N, N) x (B, N, d) -> (B, N, d)
         f_att = torch.bmm(attn_weights, v)
-        f_att = f_att.permute(0, 2, 1).view(B, self.latent_dim, H, W)  # (B, d, H, W)
+        f_att = f_att.transpose(1, 2).reshape(B, self.latent_dim, H, W)
 
         # 4. Gated residual connection
         f_out = f_r + self.gamma * self.out_proj(f_att)
@@ -145,6 +150,8 @@ class DarkVesselNet(nn.Module):
         super().__init__()
         if use_cgcam and early_fusion:
             raise ValueError("Choose CGCAM or early fusion, not both.")
+        if num_classes != 2:
+            raise ValueError("The project contract requires two classes: vessel and structure.")
         self.use_cgcam = use_cgcam
         self.early_fusion = early_fusion
         self.num_classes = num_classes
@@ -211,7 +218,13 @@ class DarkVesselNet(nn.Module):
         Returns:
             heatmap: (B, 2, 256, 256) with values clamped in [1e-4, 1.0 - 1e-4]
         """
-        # Early fusion uses all four channels; other variants use radar here.
+        allowed_channels = (INPUT_CHANNELS,) if self.use_cgcam or self.early_fusion else (2, INPUT_CHANNELS)
+        if x.ndim != 4 or x.shape[1] not in allowed_channels:
+            raise ValueError(f"Expected (B, C, H, W) with C in {allowed_channels}.")
+        if any(size < 8 or size % 8 for size in x.shape[2:]):
+            raise ValueError("Input height and width must be positive multiples of 8.")
+        if not x.is_floating_point():
+            raise TypeError("Expected normalized floating-point input.")
         x_radar = x if self.early_fusion else x[:, :2]
 
         # 1. Extract backbone features: (B, 128, 32, 32) for 256x256 patches.
