@@ -165,17 +165,27 @@ class DarkVesselNet(nn.Module):
             ResidualBlock(128),
         )
 
+        # A 32x32 bottleneck (the formulary's example) keeps N=1024: the dense
+        # attention matrix has 16x fewer elements than attention at 64x64.
+        # This spatial choice is shared by all three variants for ablation.
+        self.radar_bottleneck = ConvBlock(128, 128, stride=2)  # 64 -> 32
+
         # --- B/C. Context Encoder and CGCAM (Proposed Model Only) ---
         # Baselines contain no unused context parameters or BatchNorm updates.
         if self.use_cgcam:
             self.context_stem = nn.Sequential(
                 ConvBlock(2, 32, stride=2),   # 256 -> 128
                 ConvBlock(32, 64, stride=2),  # 128 -> 64
+                ConvBlock(64, 64, stride=2),  # 64 -> 32
                 ResidualBlock(64),
             )
             self.cgcam = CGCAMModule(radar_channels=128, context_channels=64, latent_dim=64)
 
-        # --- D. Decoder & Upsampling Neck (64x64 -> 256x256) ---
+        # --- D. Decoder & Upsampling Neck (32x32 -> 256x256) ---
+        self.decoder_up0 = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),  # 32 -> 64
+            ConvBlock(128, 128),
+        )
         self.decoder_up1 = nn.Sequential(
             nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),  # 64 -> 128
             ConvBlock(128, 64, kernel_size=3, stride=1, padding=1),
@@ -204,11 +214,12 @@ class DarkVesselNet(nn.Module):
         # Early fusion uses all four channels; other variants use radar here.
         x_radar = x if self.early_fusion else x[:, :2]
 
-        # 1. Extract radar features: (B, 128, 64, 64)
+        # 1. Extract backbone features: (B, 128, 32, 32) for 256x256 patches.
         f_r = self.radar_stem(x_radar)
         f_r = self.radar_stage1(f_r)
         f_r = self.radar_down(f_r)
         f_r = self.radar_stage2(f_r)
+        f_r = self.radar_bottleneck(f_r)
 
         # 2/3. Extract context and cross-attend only in the proposed model.
         if self.use_cgcam:
@@ -218,7 +229,8 @@ class DarkVesselNet(nn.Module):
             f_out = f_r
 
         # 4. Decoder upsampling back to (256, 256)
-        d1 = self.decoder_up1(f_out)  # (B, 64, 128, 128)
+        d0 = self.decoder_up0(f_out)  # (B, 128, 64, 64)
+        d1 = self.decoder_up1(d0)    # (B, 64, 128, 128)
         d2 = self.decoder_up2(d1)     # (B, 32, 256, 256)
 
         # 5. Compute raw logits and apply sigmoid
