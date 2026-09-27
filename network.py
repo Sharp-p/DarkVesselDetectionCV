@@ -5,12 +5,20 @@ Neural Network Architecture for Dark Vessel Detection via Multimodal SAR and CGC
 Option 1: Unified 2-Channel Anchor-Free CenterNet Heatmap (Vessel + Structure).
 
 Key Components:
-1. RadarBackbone: Multi-scale CNN extracting high-resolution radar representations (F_r).
-2. ContextEncoder: Lightweight CNN extracting geophysical prior features (F_c).
-3. CGCAM (Context-Guided Cross-Attention Module): Computes cross-attention between
+1. Radar backbone: Multi-scale residual CNN extracting radar representations (F_r).
+2. Context encoder: Lightweight CNN extracting geophysical prior features (F_c).
+3. CGCAMModule (Context-Guided Cross-Attention Module): Computes cross-attention between
    geophysical queries (Q) and radar keys/values (K, V) with a learnable gating residual.
-4. DecoderNeck: Lightweight upsampling path restoring spatial dimensions to (256, 256).
-5. UnifiedHeatmapHead: 2-channel 1x1 convolution predicting centroid heatmaps in [0, 1].
+4. Decoder: Upsamples the 32x32 bottleneck back to (256, 256).
+5. Heatmap head: 2-channel 1x1 convolution predicting centroid heatmaps in [0, 1].
+
+PROJECT_PLAN.md section 7 variants:
+    Model A (SAR only):   DarkVesselNet(use_cgcam=False)
+    Model B (early fusion): DarkVesselNet(use_cgcam=False, early_fusion=True)
+    Model C (proposed):   DarkVesselNet(use_cgcam=True)
+
+Inputs must already be normalized by data.py. Target generation, focal loss,
+peak extraction, and detection metrics belong to the data/training/evaluation modules.
 """
 
 import math
@@ -68,8 +76,8 @@ class CGCAMModule(nn.Module):
     - Context features (bathymetry, distance-to-shore) act as QUERIES (Q).
     - Radar features (VV, VH) act as KEYS (K) and VALUES (V).
     
-    Computes spatial cross-attention to suppress high-backscatter coastal false alarms
-    (cliffs, islands) where geophysical priors indicate non-navigable water or land.
+    Implements FORMULARY.md sections 4.1-4.3 exactly. Suppression of coastal false
+    alarms is a learned behavior to evaluate, not a fixed geographic mask.
     """
     def __init__(self, radar_channels: int = 128, context_channels: int = 64, latent_dim: int = 64):
         super().__init__()
@@ -130,10 +138,15 @@ class DarkVesselNet(nn.Module):
     
     Input:
         (B, 4, 256, 256) where channels are:
-        - 0: VH_dB
-        - 1: VV_dB
-        - 2: bathymetry
-        - 3: distance_to_shore
+        - 0: normalized VH_dB
+        - 1: normalized VV_dB
+        - 2: normalized bathymetry
+        - 3: normalized distance_to_shore
+
+        SAR-only mode also accepts (B, 2, 256, 256). With four-channel input it
+        ignores channels 2 and 3 entirely. Early fusion feeds all four channels
+        into the backbone's first convolution; CGCAM keeps the streams separate.
+        Smaller/larger spatial dimensions divisible by 8 are supported for testing.
         
     Output:
         (B, 2, 256, 256) spatial probability heatmap:
@@ -171,7 +184,6 @@ class DarkVesselNet(nn.Module):
             ResidualBlock(128),
             ResidualBlock(128),
         )
-
         # A 32x32 bottleneck (the formulary's example) keeps N=1024: the dense
         # attention matrix has 16x fewer elements than attention at 64x64.
         # This spatial choice is shared by all three variants for ablation.
@@ -214,9 +226,10 @@ class DarkVesselNet(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            x: Input tensor (B, 4, 256, 256)
+            x: Normalized input (B, 4, H, W); SAR-only also accepts two channels.
+               H and W must be positive multiples of 8 (normally PATCH_SIZE).
         Returns:
-            heatmap: (B, 2, 256, 256) with values clamped in [1e-4, 1.0 - 1e-4]
+            heatmap: (B, 2, H, W) float32 probabilities in [1e-4, 1.0 - 1e-4]
         """
         allowed_channels = (INPUT_CHANNELS,) if self.use_cgcam or self.early_fusion else (2, INPUT_CHANNELS)
         if x.ndim != 4 or x.shape[1] not in allowed_channels:
@@ -259,15 +272,18 @@ class DarkVesselNet(nn.Module):
 
 if __name__ == "__main__":
     print("Testing DarkVesselNet architecture contract...")
-    model = DarkVesselNet(use_cgcam=True, num_classes=NUM_CLASSES)
-    model.eval()
-
-    dummy_input = torch.randn(2, 4, 256, 256)
-    with torch.no_grad():
-        out = model(dummy_input)
-
-    print(f"Model Input shape:  {dummy_input.shape}")
-    print(f"Model Output shape: {out.shape} (Expected: (2, 2, 256, 256))")
-    print(f"Output range: min={out.min().item():.4f}, max={out.max().item():.4f}")
-    assert out.shape == (2, 2, 256, 256), "Shape mismatch with Option 1 contract!"
+    dummy_input = torch.rand(4, INPUT_CHANNELS, PATCH_SIZE, PATCH_SIZE)
+    for name, kwargs in (
+        ("A / SAR only", {"use_cgcam": False}),
+        ("B / early fusion", {"use_cgcam": False, "early_fusion": True}),
+        ("C / CGCAM", {"use_cgcam": True}),
+    ):
+        model = DarkVesselNet(**kwargs).eval()
+        with torch.no_grad():
+            out = model(dummy_input)
+        assert out.shape == (4, NUM_CLASSES, PATCH_SIZE, PATCH_SIZE), "Shape mismatch!"
+        assert torch.isfinite(out).all(), "Non-finite heatmap!"
+        assert ((out > 0) & (out < 1)).all(), "Invalid probability!"
+        print(f"{name}: {tuple(dummy_input.shape)} -> {tuple(out.shape)}, "
+              f"range=[{out.min().item():.4f}, {out.max().item():.4f}]")
     print("Architecture contract verified successfully!")
