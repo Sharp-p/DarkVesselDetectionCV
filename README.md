@@ -48,9 +48,11 @@ DarkVesselDetectionCV/
 ```bash
 python network.py
 ```
-Expected output:
+Example output (the probability ranges vary):
 ```text
-Model Input shape:  torch.Size([2, 4, 256, 256])
-Model Output shape: torch.Size([2, 2, 256, 256])
+Testing DarkVesselNet architecture contract...
+A / SAR only: (4, 4, 256, 256) -> (4, 2, 256, 256), range=[...]
+B / early fusion: (4, 4, 256, 256) -> (4, 2, 256, 256), range=[...]
+C / CGCAM: (4, 4, 256, 256) -> (4, 2, 256, 256), range=[...]
 Architecture contract verified successfully!
 ```
