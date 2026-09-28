@@ -13,9 +13,13 @@ Key Components:
 5. Heatmap head: 2-channel 1x1 convolution predicting centroid heatmaps in [0, 1].
 
 PROJECT_PLAN.md section 7 variants:
-    Model A (SAR only):   DarkVesselNet(use_cgcam=False)
-    Model B (early fusion): DarkVesselNet(use_cgcam=False, early_fusion=True)
-    Model C (proposed):   DarkVesselNet(use_cgcam=True)
+    Model A (SAR only):     DarkVesselNet(fusion_mode="sar_only")
+    Model B (early fusion): DarkVesselNet(fusion_mode="early_fusion")
+    Model C-wind:           DarkVesselNet(fusion_mode="cgcam_no_wind")
+    Model C (proposed):     DarkVesselNet(fusion_mode="cgcam")
+
+All four variants accept (B, 5, H, W) in the order
+[VH_dB, VV_dB, bathymetry, distance_to_shore, wind_speed].
 
 Inputs must already be normalized by data.py. Target generation, focal loss,
 peak extraction, and detection metrics belong to the data/training/evaluation modules.
@@ -26,7 +30,19 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from globals import PATCH_SIZE, INPUT_CHANNELS, NUM_CLASSES, USE_CGCAM
+import globals as config
+from globals import PATCH_SIZE, NUM_CLASSES
+
+
+# The revised specification fixes this contract at five channels. The supplied
+# globals.py still declares four; keep this module usable without editing the
+# data engineer's file. data.py must supply all five normalized channels.
+INPUT_CHANNELS = 5
+FUSION_MODES = ("sar_only", "early_fusion", "cgcam_no_wind", "cgcam")
+# Prefer the new configuration flag, with a fallback for the supplied globals.py.
+FUSION_MODE = getattr(
+    config, "FUSION_MODE", "cgcam" if getattr(config, "USE_CGCAM", True) else "sar_only"
+)
 
 
 # -----------------------------------------------------------------------------
@@ -73,11 +89,11 @@ class CGCAMModule(nn.Module):
     Context-Guided Cross-Attention Module (CGCAM).
     
     Decouples radar features from geophysical context:
-    - Context features (bathymetry, distance-to-shore) act as QUERIES (Q).
+    - Context features (bathymetry, distance-to-shore, wind speed) act as QUERIES (Q).
     - Radar features (VV, VH) act as KEYS (K) and VALUES (V).
     
-    Implements FORMULARY.md sections 4.1-4.3 exactly. Suppression of coastal false
-    alarms is a learned behavior to evaluate, not a fixed geographic mask.
+    Implements FORMULARY.md sections 4.1-4.3 exactly. Suppression of coastal and
+    wind-driven false alarms is a learned behavior to evaluate, not a fixed mask.
     """
     def __init__(self, radar_channels: int = 128, context_channels: int = 64, latent_dim: int = 64):
         super().__init__()
@@ -137,15 +153,19 @@ class DarkVesselNet(nn.Module):
     Unified 2-Channel Anchor-Free CenterNet with CGCAM.
     
     Input:
-        (B, 4, 256, 256) where channels are:
+        (B, 5, 256, 256) where channels are:
         - 0: normalized VH_dB
         - 1: normalized VV_dB
         - 2: normalized bathymetry
         - 3: normalized distance_to_shore
+        - 4: normalized wind_speed
 
-        SAR-only mode also accepts (B, 2, 256, 256). With four-channel input it
-        ignores channels 2 and 3 entirely. Early fusion feeds all four channels
-        into the backbone's first convolution; CGCAM keeps the streams separate.
+        sar_only: only channels 0 and 1 reach the radar backbone.
+        early_fusion: all five channels enter the backbone's first convolution.
+        cgcam_no_wind: decoupled streams, with the context wind channel zeroed.
+        cgcam: radar channels 0:2 and context channels 2:5 stay separate until CGCAM.
+        Both CGCAM variants have identical parameter shapes; only wind routing
+        differs, allowing a controlled comparison with the same initialization.
         Smaller/larger spatial dimensions divisible by 8 are supported for testing.
         
     Output:
@@ -155,23 +175,22 @@ class DarkVesselNet(nn.Module):
     """
     def __init__(
         self,
-        use_cgcam: bool = USE_CGCAM,
+        fusion_mode: str = FUSION_MODE,
         num_classes: int = NUM_CLASSES,
-        *,
-        early_fusion: bool = False,
     ):
         super().__init__()
-        if use_cgcam and early_fusion:
-            raise ValueError("Choose CGCAM or early fusion, not both.")
+        if fusion_mode not in FUSION_MODES:
+            raise ValueError(f"fusion_mode must be one of {FUSION_MODES}; got {fusion_mode!r}.")
         if num_classes != 2:
             raise ValueError("The project contract requires two classes: vessel and structure.")
-        self.use_cgcam = use_cgcam
-        self.early_fusion = early_fusion
+        self.fusion_mode = fusion_mode
+        self.use_cgcam = fusion_mode in ("cgcam_no_wind", "cgcam")
+        self.early_fusion = fusion_mode == "early_fusion"
         self.num_classes = num_classes
 
         # --- A. Radar Backbone (Channels 0 & 1: VH, VV) ---
         self.radar_stem = nn.Sequential(
-            ConvBlock(in_channels=INPUT_CHANNELS if early_fusion else 2, out_channels=32,
+            ConvBlock(in_channels=INPUT_CHANNELS if self.early_fusion else 2, out_channels=32,
                       kernel_size=3, stride=1, padding=1),
             ConvBlock(in_channels=32, out_channels=64, kernel_size=3, stride=2, padding=1),  # 256 -> 128
         )
@@ -186,14 +205,14 @@ class DarkVesselNet(nn.Module):
         )
         # A 32x32 bottleneck (the formulary's example) keeps N=1024: the dense
         # attention matrix has 16x fewer elements than attention at 64x64.
-        # This spatial choice is shared by all three variants for ablation.
+        # This spatial choice is shared by all four variants for ablation.
         self.radar_bottleneck = ConvBlock(128, 128, stride=2)  # 64 -> 32
 
         # --- B/C. Context Encoder and CGCAM (Proposed Model Only) ---
         # Baselines contain no unused context parameters or BatchNorm updates.
         if self.use_cgcam:
             self.context_stem = nn.Sequential(
-                ConvBlock(2, 32, stride=2),   # 256 -> 128
+                ConvBlock(3, 32, stride=2),   # Bathymetry, shore, wind; 256 -> 128
                 ConvBlock(32, 64, stride=2),  # 128 -> 64
                 ConvBlock(64, 64, stride=2),  # 64 -> 32
                 ResidualBlock(64),
@@ -226,14 +245,16 @@ class DarkVesselNet(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            x: Normalized input (B, 4, H, W); SAR-only also accepts two channels.
+            x: Normalized input (B, 5, H, W), shared by every fusion mode.
                H and W must be positive multiples of 8 (normally PATCH_SIZE).
         Returns:
             heatmap: (B, 2, H, W) float32 probabilities in [1e-4, 1.0 - 1e-4]
         """
-        allowed_channels = (INPUT_CHANNELS,) if self.use_cgcam or self.early_fusion else (2, INPUT_CHANNELS)
-        if x.ndim != 4 or x.shape[1] not in allowed_channels:
-            raise ValueError(f"Expected (B, C, H, W) with C in {allowed_channels}.")
+        if x.ndim != 4 or x.shape[1] != INPUT_CHANNELS:
+            raise ValueError(
+                "Expected (B, 5, H, W) with channels "
+                "[VH_dB, VV_dB, bathymetry, distance_to_shore, wind_speed]."
+            )
         if any(size < 8 or size % 8 for size in x.shape[2:]):
             raise ValueError("Input height and width must be positive multiples of 8.")
         if not x.is_floating_point():
@@ -249,7 +270,12 @@ class DarkVesselNet(nn.Module):
 
         # 2/3. Extract context and cross-attend only in the proposed model.
         if self.use_cgcam:
-            f_c = self.context_stem(x[:, 2:4])
+            x_context = x[:, 2:5]
+            if self.fusion_mode == "cgcam_no_wind":
+                # Preserve the three-channel encoder and the caller's input.
+                # Zeroing only wind also removes its gradient from this variant.
+                x_context = torch.cat((x[:, 2:4], torch.zeros_like(x[:, 4:5])), dim=1)
+            f_c = self.context_stem(x_context)
             f_out = self.cgcam(f_r, f_c)
         else:
             f_out = f_r
@@ -273,12 +299,13 @@ class DarkVesselNet(nn.Module):
 if __name__ == "__main__":
     print("Testing DarkVesselNet architecture contract...")
     dummy_input = torch.rand(4, INPUT_CHANNELS, PATCH_SIZE, PATCH_SIZE)
-    for name, kwargs in (
-        ("A / SAR only", {"use_cgcam": False}),
-        ("B / early fusion", {"use_cgcam": False, "early_fusion": True}),
-        ("C / CGCAM", {"use_cgcam": True}),
+    for name, fusion_mode in (
+        ("A / SAR only", "sar_only"),
+        ("B / early fusion", "early_fusion"),
+        ("C-wind / CGCAM without wind", "cgcam_no_wind"),
+        ("C / CGCAM", "cgcam"),
     ):
-        model = DarkVesselNet(**kwargs).eval()
+        model = DarkVesselNet(fusion_mode=fusion_mode).eval()
         with torch.no_grad():
             out = model(dummy_input)
         assert out.shape == (4, NUM_CLASSES, PATCH_SIZE, PATCH_SIZE), "Shape mismatch!"
