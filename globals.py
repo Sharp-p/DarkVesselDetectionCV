@@ -63,17 +63,18 @@ VV_MIN_DB = -30.0
 VV_MAX_DB = 15.0
 MAX_DISTANCE_SHORE_METERS = 50000.0  # 50 km normalization scale
 MAX_BATHYMETRY_METERS = -2000.0      # 2000 m ocean depth normalization
+MAX_WIND_SPEED_MS = 25.0            # Clip and scale wind speed (m/s) to [0.0, 1.0]
 NODATA_VALUE = -32768.0
 
 # ---------------------------------------------------------
 # 4. Patch & Model Input/Output Tensor Contracts (Option 1)
 # ---------------------------------------------------------
 PATCH_SIZE = 256    # H = W = 256
-INPUT_CHANNELS = 4  # [0: VH_dB, 1: VV_dB, 2: bathymetry, 3: distance_to_shore]
+INPUT_CHANNELS = 5  # [0: VH_dB, 1: VV_dB, 2: bathymetry, 3: distance_to_shore, 4: wind_speed]
 NUM_CLASSES = 2     # [0: Mobile Vessel, 1: Fixed Offshore Structure]
 
 # Expected Batch Tensor Shapes:
-# Model Input:   (Batch_Size, 4, PATCH_SIZE, PATCH_SIZE)
+# Model Input:   (Batch_Size, 5, PATCH_SIZE, PATCH_SIZE), shared by all fusion modes
 # Model Output:  (Batch_Size, 2, PATCH_SIZE, PATCH_SIZE)
 #   - Channel 0: Mobile Vessel Centroid Gaussian peaks in [0.0, 1.0]
 #   - Channel 1: Fixed Offshore Structure Centroid Gaussian peaks in [0.0, 1.0]
@@ -95,9 +96,17 @@ GAUSSIAN_RADIAL_SIGMA = 2.0  # Radius of ground-truth target Gaussian peaks in p
 # Peak Detection & Evaluation Thresholds
 PEAK_CONFIDENCE_THRESHOLD = 0.3  # Minimum heatmap activation to declare a detection
 NMS_KERNEL_SIZE = 3              # Local max-pooling window (3x3 pixels) for peak extraction
-MATCH_DISTANCE_PIXELS = 10       # Tolerance radius (100 meters at 10m/pixel) for true positives
+MATCH_DISTANCE_PIXELS = 20       # Tolerance radius (200 meters at 10m/pixel) for true positives
 
 # ---------------------------------------------------------
 # 6. Novelty & Ablation Study Settings
 # ---------------------------------------------------------
-USE_CGCAM = True  # Toggle True (Proposed CGCAM) vs False (Baseline SAR-Only)
+# Select the default model with FUSION_MODE; network.DarkVesselNet also accepts
+# an explicit fusion_mode argument for running the four-way ablation study.
+# - "sar_only":      Model A (VH/VV only; context channels ignored)
+# - "early_fusion":  Model B (all five channels concatenated at the backbone input)
+# - "cgcam_no_wind": Model C-wind (CGCAM with the wind context channel zeroed)
+# - "cgcam":         Model C (decoupled radar and three-channel context encoders)
+FUSION_MODE = "cgcam"
+# Derived compatibility flag; use FUSION_MODE to choose the architecture.
+USE_CGCAM = FUSION_MODE in ("cgcam", "cgcam_no_wind")
