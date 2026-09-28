@@ -14,7 +14,8 @@ import numpy as np
 # ---------------------------------------------------------
 # 1. Deterministic Reproducibility & Device Configuration
 # ---------------------------------------------------------
-RANDOM_SEED = 42
+
+RANDOM_SEED = 111
 
 def set_seed(seed: int = RANDOM_SEED) -> None:
     random.seed(seed)
