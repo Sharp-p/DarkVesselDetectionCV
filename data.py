@@ -30,7 +30,7 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 
 from globals import (
-    PATCH_SIZE, INPUT_CHANNELS, NUM_CLASSES,
+    PATCH_SIZE, PATCH_JITTER_PX, INPUT_CHANNELS, NUM_CLASSES,
     VH_MIN_DB, VH_MAX_DB, VV_MIN_DB, VV_MAX_DB,
     MAX_DISTANCE_SHORE_METERS, MAX_BATHYMETRY_METERS, MAX_WIND_SPEED_MS, NODATA_VALUE,
     GAUSSIAN_RADIAL_SIGMA, BATCH_SIZE, NUM_WORKERS,
@@ -140,7 +140,7 @@ class SceneContextCache:
         bathy_raw = tifffile.imread(bathy_path).astype(np.float32)
         self.bathy_norm = normalize_bathymetry(bathy_raw)
 
-        # In Sentinel-1 OWI products: 0 = useful ocean, 1 = land, 2 = ice.
+        # in Sentinel-1 OWI products: 0 = useful ocean, 1 = land, 2 = ice.
         owi_raw = tifffile.imread(owi_path)
         is_ocean = (owi_raw == 0) # we change the 0 pixels to True (1) and the rest False (0)
         # EDT computes distance from non-zero pixels to the nearest zero pixel (land/ice).
@@ -330,10 +330,12 @@ class DarkVesselDataset(Dataset):
 
         r0, c0 = sample["r0"], sample["c0"]
 
-        # In training mode for positive samples, apply random spatial jitter (+- 32 px)
+        # Train-only jitter on positive patches: breaks the "target always at patch center"
+        # shortcut. Amplitude PATCH_JITTER_PX keeps the centroid at >= 20 px from any border,
+        # so the 3*sigma Gaussian target is never clipped.
         if self.is_train and sample["is_positive"]:
-            jitter_r = np.random.randint(-32, 33)
-            jitter_c = np.random.randint(-32, 33)
+            jitter_r = np.random.randint(-PATCH_JITTER_PX, PATCH_JITTER_PX + 1)
+            jitter_c = np.random.randint(-PATCH_JITTER_PX, PATCH_JITTER_PX + 1)
             r0 = max(0, min(H_sar - PATCH_SIZE, r0 + jitter_r))
             c0 = max(0, min(W_sar - PATCH_SIZE, c0 + jitter_c))
 

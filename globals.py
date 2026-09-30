@@ -71,6 +71,9 @@ NODATA_VALUE = -32768.0
 # 4. Patch & Model Input/Output Tensor Contracts (Option 1)
 # ---------------------------------------------------------
 PATCH_SIZE = 256    # H = W = 256
+PATCH_JITTER_PX = 108  # Max jitter of positive patch origin (train only). Target centroid
+                       # lands in [20, 236]; 20 px border margin > 3*GAUSSIAN_RADIAL_SIGMA = 6 px,
+                       # so the Gaussian target is never truncated by patch borders.
 INPUT_CHANNELS = 5  # [0: VH_dB, 1: VV_dB, 2: bathymetry, 3: distance_to_shore, 4: wind_speed]
 NUM_CLASSES = 2     # [0: Mobile Vessel, 1: Fixed Offshore Structure]
 
