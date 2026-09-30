@@ -35,7 +35,8 @@ DEVICE = torch.device(
 # 2. File System Paths & Scene Partitioning (Scene-Level)
 # ---------------------------------------------------------
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.join(PROJECT_ROOT, "..", "downloaded")
+DATA_DIR = os.path.join(PROJECT_ROOT, "dataset")
+LABELS_PATH = os.path.join(DATA_DIR, "labels.csv")
 CHECKPOINT_DIR = os.path.join(PROJECT_ROOT, "checkpoints")
 RESULTS_DIR = os.path.join(PROJECT_ROOT, "results")
 
@@ -63,18 +64,22 @@ VV_MIN_DB = -30.0
 VV_MAX_DB = 15.0
 MAX_DISTANCE_SHORE_METERS = 50000.0  # 50 km normalization scale
 MAX_BATHYMETRY_METERS = -2000.0      # 2000 m ocean depth normalization
+MAX_WIND_SPEED_MS = 25.0              # Clip and scale wind speed (m/s) to [0.0, 1.0]
 NODATA_VALUE = -32768.0
 
 # ---------------------------------------------------------
 # 4. Patch & Model Input/Output Tensor Contracts (Option 1)
 # ---------------------------------------------------------
 PATCH_SIZE = 256    # H = W = 256
-INPUT_CHANNELS = 4  # [0: VH_dB, 1: VV_dB, 2: bathymetry, 3: distance_to_shore]
+PATCH_JITTER_PX = 108  # Max jitter of positive patch origin (train only). Target centroid
+                       # lands in [20, 236]; 20 px border margin > 3*GAUSSIAN_RADIAL_SIGMA = 6 px,
+                       # so the Gaussian target is never truncated by patch borders.
+INPUT_CHANNELS = 5  # [0: VH_dB, 1: VV_dB, 2: bathymetry, 3: distance_to_shore, 4: wind_speed]
 NUM_CLASSES = 2     # [0: Mobile Vessel, 1: Fixed Offshore Structure]
 
 # Expected Batch Tensor Shapes:
-# Model Input:   (Batch_Size, 4, PATCH_SIZE, PATCH_SIZE)
-# Model Output:  (Batch_Size, 2, PATCH_SIZE, PATCH_SIZE)
+# Model Input:   (Batch_Size, 5, PATCH_SIZE, PATCH_SIZE)
+# Model Target:  (Batch_Size, 2, PATCH_SIZE, PATCH_SIZE)
 #   - Channel 0: Mobile Vessel Centroid Gaussian peaks in [0.0, 1.0]
 #   - Channel 1: Fixed Offshore Structure Centroid Gaussian peaks in [0.0, 1.0]
 
@@ -95,9 +100,17 @@ GAUSSIAN_RADIAL_SIGMA = 2.0  # Radius of ground-truth target Gaussian peaks in p
 # Peak Detection & Evaluation Thresholds
 PEAK_CONFIDENCE_THRESHOLD = 0.3  # Minimum heatmap activation to declare a detection
 NMS_KERNEL_SIZE = 3              # Local max-pooling window (3x3 pixels) for peak extraction
-MATCH_DISTANCE_PIXELS = 10       # Tolerance radius (100 meters at 10m/pixel) for true positives
+MATCH_DISTANCE_PIXELS = 20       # 200 meters at 10m/px
 
 # ---------------------------------------------------------
 # 6. Novelty & Ablation Study Settings
 # ---------------------------------------------------------
-USE_CGCAM = True  # Toggle True (Proposed CGCAM) vs False (Baseline SAR-Only)
+# Supported ablation configurations:
+# - "sar_only": Model A (Baseline: SAR VV/VH only into 2-channel backbone)
+# - "early_fusion": Model B (Baseline: Early fusion of all 5 channels into 5-channel backbone)
+# - "cgcam": Model C (Proposed: Decoupled radar backbone + context encoder + CGCAM cross-attention)
+# - "cgcam_no_wind": Model C-wind (CGCAM without wind speed channel to isolate wind contribution)
+FUSION_MODE = "cgcam"  # one of: "sar_only", "early_fusion", "cgcam"
+USE_CGCAM = (FUSION_MODE == "cgcam")
+
+
