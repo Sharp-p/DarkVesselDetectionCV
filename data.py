@@ -103,17 +103,19 @@ def draw_gaussian_peak(
     radius = int(3 * sigma)
 
     x0 = max(0, center_x - radius)
-    x1 = min(W, center_x + radius + 1)
+    x1 = min(W, center_x + radius + 1) # +1 to include c_x + r
     y0 = max(0, center_y - radius)
     y1 = min(H, center_y + radius + 1)
 
-    if x0 >= x1 or y0 >= y1:
+    if x0 >= x1 or y0 >= y1: # happens only if the gaussian is completely out of the heatmap
         return
 
     grid_y, grid_x = np.ogrid[y0:y1, x0:x1]
-    dist_sq = (grid_x - center_x) ** 2 + (grid_y - center_y) ** 2
+    dist_sq = (grid_x - center_x) ** 2 + (grid_y - center_y) ** 2 # square euclidean distance between each pixel and the center
+    # calculate bidimensional gaussian distribution
     gaussian = np.exp(-dist_sq / (2.0 * sigma * sigma)).astype(np.float32)
 
+    # getting the maximum and not summing prevents going over 1 in the probability (centernet paradigm)
     heatmap[y0:y1, x0:x1] = np.maximum(heatmap[y0:y1, x0:x1], gaussian)
 
 
