@@ -110,8 +110,10 @@ def draw_gaussian_peak(
     if x0 >= x1 or y0 >= y1: # happens only if the gaussian is completely out of the heatmap
         return
 
+    # vectors containing the coordinates in the grid over the subgrid stands
     grid_y, grid_x = np.ogrid[y0:y1, x0:x1]
-    dist_sq = (grid_x - center_x) ** 2 + (grid_y - center_y) ** 2 # square euclidean distance between each pixel and the center
+    # square euclidean distance between each pixel and the center
+    dist_sq = (grid_x - center_x) ** 2 + (grid_y - center_y) ** 2 
     # calculate bidimensional gaussian distribution
     gaussian = np.exp(-dist_sq / (2.0 * sigma * sigma)).astype(np.float32)
 
@@ -134,17 +136,18 @@ class SceneContextCache:
         owi_path = os.path.join(scene_dir, "owiMask.tif")
         wind_path = os.path.join(scene_dir, "owiWindSpeed.tif")
 
+        # read raw bathymetry data
         bathy_raw = tifffile.imread(bathy_path).astype(np.float32)
         self.bathy_norm = normalize_bathymetry(bathy_raw)
 
         # In Sentinel-1 OWI products: 0 = useful ocean, 1 = land, 2 = ice.
-        # EDT computes distance from non-zero pixels to the nearest zero pixel (land).
         owi_raw = tifffile.imread(owi_path)
-        is_ocean = (owi_raw == 0)
+        is_ocean = (owi_raw == 0) # we change the 0 pixels to True (1) and the rest False (0)
+        # EDT computes distance from non-zero pixels to the nearest zero pixel (land/ice).
         dist_pixels = distance_transform_edt(is_ocean)
         dist_meters = (dist_pixels * 500.0).astype(np.float32)  # ~500m/pixel spatial resolution
 
-        # Ensure identical spatial grid between bathymetry and EDT shore distance
+        # ensure identical spatial grid dimension between bathymetry and EDT shore distance
         if dist_meters.shape != self.bathy_norm.shape:
             dist_meters = cv2.resize(
                 dist_meters,
@@ -163,7 +166,7 @@ class SceneContextCache:
                 (self.bathy_norm.shape[1], self.bathy_norm.shape[0]),
                 interpolation=cv2.INTER_LINEAR
             )
-
+        # we define the size of the context window as the size of the bathymetry map
         self.context_h, self.context_w = self.bathy_norm.shape
 
     def extract_context_patch(
@@ -179,19 +182,22 @@ class SceneContextCache:
         Extracts and bilinearly interpolates the corresponding context window
         to high-resolution (PATCH_SIZE, PATCH_SIZE).
         """
+        # context data and radio data have different resolution so they need to be scaled accordingly
         scale_r = self.context_h / float(sar_h)
         scale_c = self.context_w / float(sar_w)
 
+        # getting the angles of the context window related to the patch
         cr0 = max(0, int(r0 * scale_r))
         cr1 = min(self.context_h, int(math.ceil(r1 * scale_r)) + 1)
         cc0 = max(0, int(c0 * scale_c))
         cc1 = min(self.context_w, int(math.ceil(c1 * scale_c)) + 1)
 
+        # getting the actual data from the various context maps
         b_sub = self.bathy_norm[cr0:cr1, cc0:cc1]
         d_sub = self.dist_shore_norm[cr0:cr1, cc0:cc1]
         w_sub = self.wind_norm[cr0:cr1, cc0:cc1]
 
-        # Guard against zero-area slices on edge borders
+        # guard against zero-area slices on edge borders (we need at least 4 angles, not present on only one pixel)
         if b_sub.shape[0] < 2 or b_sub.shape[1] < 2:
             cr1 = min(self.context_h, cr0 + 2)
             cc1 = min(self.context_w, cc0 + 2)
@@ -199,6 +205,7 @@ class SceneContextCache:
             d_sub = self.dist_shore_norm[cr0:cr1, cc0:cc1]
             w_sub = self.wind_norm[cr0:cr1, cc0:cc1]
 
+        # resizing to the size of the SAR patch
         b_patch = cv2.resize(b_sub, (PATCH_SIZE, PATCH_SIZE), interpolation=cv2.INTER_LINEAR)
         d_patch = cv2.resize(d_sub, (PATCH_SIZE, PATCH_SIZE), interpolation=cv2.INTER_LINEAR)
         w_patch = cv2.resize(w_sub, (PATCH_SIZE, PATCH_SIZE), interpolation=cv2.INTER_LINEAR)
