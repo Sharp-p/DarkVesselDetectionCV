@@ -110,7 +110,12 @@ MATCH_DISTANCE_PIXELS = 20       # 200 meters at 10m/px
 # - "early_fusion": Model B (Baseline: Early fusion of all 5 channels into 5-channel backbone)
 # - "cgcam": Model C (Proposed: Decoupled radar backbone + context encoder + CGCAM cross-attention)
 # - "cgcam_no_wind": Model C-wind (CGCAM without wind speed channel to isolate wind contribution)
-FUSION_MODE = "cgcam"  # one of: "sar_only", "early_fusion", "cgcam"
-USE_CGCAM = (FUSION_MODE == "cgcam")
+# Supported ablation configurations (all share the same 5-channel input contract):
+# - "sar_only":      Model A      (Baseline: SAR VV/VH only into 2-channel backbone)
+# - "early_fusion":  Model B      (Baseline: Early fusion of all 5 channels into 5-channel backbone)
+# - "cgcam_no_wind": Model C-wind (Proposed CGCAM with the wind_speed channel zeroed)
+# - "cgcam":         Model C      (Proposed: Decoupled radar backbone + context encoder + CGCAM)
+FUSION_MODE = "cgcam"  # one of: "sar_only", "early_fusion", "cgcam_no_wind", "cgcam"
+USE_CGCAM = (FUSION_MODE in ("cgcam", "cgcam_no_wind"))
 
 

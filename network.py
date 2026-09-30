@@ -31,18 +31,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 import globals as config
-from globals import PATCH_SIZE, NUM_CLASSES
+from globals import PATCH_SIZE, NUM_CLASSES, INPUT_CHANNELS, FUSION_MODE
 
 
-# The revised specification fixes this contract at five channels. The supplied
-# globals.py still declares four; keep this module usable without editing the
-# data engineer's file. data.py must supply all five normalized channels.
-INPUT_CHANNELS = 5
+# Contract is defined once in globals.py (5 channels: VH, VV, bathymetry,
+# distance_to_shore, wind_speed). data.py must supply all five normalized channels.
 FUSION_MODES = ("sar_only", "early_fusion", "cgcam_no_wind", "cgcam")
-# Prefer the new configuration flag, with a fallback for the supplied globals.py.
-FUSION_MODE = getattr(
-    config, "FUSION_MODE", "cgcam" if getattr(config, "USE_CGCAM", True) else "sar_only"
-)
 
 
 # -----------------------------------------------------------------------------
