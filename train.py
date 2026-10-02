@@ -31,16 +31,18 @@ def train_one_epoch(model, optimizer, batches, device=DEVICE, max_grad_norm=1.0)
     model.train()
     epoch_losses = []
     for inputs, targets in batches:
-        inputs, targets = inputs.to(device), targets.to(device)
+        inputs, targets = inputs.to(device, non_blocking=True), targets.to(device, non_blocking=True)
         optimizer.zero_grad()
         pred = model(inputs)
         loss = focal_loss(pred, targets)
-        if not torch.isfinite(loss):
+        # Keep the pre-update safety check, using one scalar synchronization.
+        loss_value = loss.item()
+        if not math.isfinite(loss_value):
             raise FloatingPointError("Non-finite training loss")
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
         optimizer.step()
-        epoch_losses.append(loss.item())
+        epoch_losses.append(loss_value)
     if not epoch_losses:
         raise ValueError("Training loader has no batches")
     return sum(epoch_losses) / len(epoch_losses)
@@ -52,11 +54,14 @@ def validate(model, batches, device=DEVICE):
     epoch_losses = []
     with torch.no_grad():
         for inputs, targets in batches:
-            inputs, targets = inputs.to(device), targets.to(device)
+            inputs, targets = inputs.to(device, non_blocking=True), targets.to(device, non_blocking=True)
             pred = model(inputs)
             loss = focal_loss(pred, targets)
-            epoch_losses.append(loss.item())
-    if not epoch_losses or not all(math.isfinite(x) for x in epoch_losses):
+            epoch_losses.append(loss)
+    if not epoch_losses:
+        raise ValueError("Validation loader is empty or has non-finite losses")
+    epoch_losses = torch.stack(epoch_losses).cpu().tolist()
+    if not all(math.isfinite(x) for x in epoch_losses):
         raise ValueError("Validation loader is empty or has non-finite losses")
     return sum(epoch_losses) / len(epoch_losses)
 

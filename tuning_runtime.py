@@ -1,6 +1,7 @@
 """Seeded loaders, synthetic smoke data, and sparse detection caching."""
 import hashlib
 import json
+import math
 import random
 from pathlib import Path
 
@@ -58,40 +59,78 @@ def make_loader(cfg, split, seed):
     return DataLoader(dataset, batch_size=cfg["batch_size"], shuffle=split == "train",
                       num_workers=cfg["workers"], worker_init_fn=seed_worker,
                       generator=torch.Generator().manual_seed(seed),
-                      pin_memory=str(cfg["device"]).startswith("cuda"))
+                      pin_memory=str(cfg["device"]).startswith("cuda"),
+                      persistent_workers=cfg["workers"] > 0)
 
 
-@torch.no_grad()
-def collect_candidates(model, batches, device, min_score):
+def iter_candidate_records(records):
+    """Materialize legacy tuples only at the public/JSON serialization boundary."""
+    for record in records:
+        yield {
+            "pred": [[(int(r), int(c), float(s), bool(near))
+                      for r, c, s, near in (p.tolist() if isinstance(p, np.ndarray) else p)]
+                     for p in record["pred"]],
+            "gt": [[(int(r), int(c))
+                    for r, c in (g.tolist() if isinstance(g, np.ndarray) else g)]
+                   for g in record["gt"]],
+        }
+
+
+@torch.inference_mode()
+def collect_candidates(model, batches, device, min_score, *, compact=False):
     """One forward per batch; cache sparse local maxima, GT and coastal flags.
 
     Local maxima are detected on raw logits (no clamp plateaus). Scores are
     sigmoid(logits), using a boolean mask so a zero logit is a valid detection.
+    The tuning loop uses compact NumPy arrays; the default retains the original
+    tuple-based API. Only sparse indices, scores and flags cross to the CPU.
     """
     model.eval()
     records, losses = [], []
     for inputs, targets in batches:
-        heatmap, logits = model(inputs.to(device), return_logits=True)
-        loss = focal_loss(heatmap, targets.to(device))
-        if not torch.isfinite(loss):
-            raise FloatingPointError("Non-finite validation/evaluation loss")
-        losses.append(float(loss))
+        inputs = inputs.to(device, non_blocking=True)
+        targets = targets.to(device, non_blocking=True)
+        heatmap, logits = model(inputs, return_logits=True)
+        losses.append(focal_loss(heatmap, targets))
         scores = logits.sigmoid()
         maxima = logits.eq(F.max_pool2d(logits, 3, stride=1, padding=1)) & scores.ge(min_score)
-        maxima, scores, targets = maxima.cpu(), scores.cpu(), targets.cpu()
-        for b in range(len(inputs)):
+        batch_size, channels, height, width = logits.shape
+        area = height * width
+        # One nonzero per whole batch, not per image/class. CUDA nonzero still
+        # synchronizes, but no dense map or individual tensor scalar is copied.
+        indices = torch.nonzero(maxima.reshape(-1), as_tuple=True)[0]
+        shore_indices = (indices // (channels * area)) * area + indices % area
+        sparse_scores = scores.reshape(-1)[indices]
+        sparse_coastal = inputs[:, 3].reshape(-1)[shore_indices].le(0.1)
+        gt_indices = torch.nonzero(targets.eq(1).reshape(-1), as_tuple=True)[0]
+        # numpy does not support bfloat16; float32 preserves its scores exactly.
+        score_dtype = torch.float64 if scores.dtype == torch.float64 else torch.float32
+        flat = indices.cpu().numpy()
+        values = sparse_scores.to(score_dtype).cpu().numpy()
+        coastal = sparse_coastal.cpu().numpy()
+        gt_flat = gt_indices.cpu().numpy()
+        spatial, gt_spatial = flat % area, gt_flat % area
+        predictions = np.column_stack((spatial // width, spatial % width, values, coastal))
+        ground_truth = np.column_stack((gt_spatial // width, gt_spatial % width))
+        # nonzero is lexicographically ordered, so slices preserve row/col ties
+        # and retain empty images/classes without sorting or per-detection loops.
+        boundaries = np.arange(batch_size * channels + 1) * area
+        pred_offsets = np.searchsorted(flat, boundaries)
+        gt_offsets = np.searchsorted(gt_flat, boundaries)
+        for b in range(batch_size):
             record = {"pred": [], "gt": []}
-            for c in range(2):
-                coords = torch.nonzero(maxima[b, c], as_tuple=False)
-                preds = [(int(r), int(k), float(scores[b, c, r, k]),
-                          bool(inputs[b, 3, r, k] <= 0.1)) for r, k in coords]
-                gt = [(int(r), int(k)) for r, k in torch.nonzero(targets[b, c].eq(1), as_tuple=False)]
-                record["pred"].append(preds)
-                record["gt"].append(gt)
+            for c in range(channels):
+                group = b * channels + c
+                record["pred"].append(predictions[pred_offsets[group]:pred_offsets[group + 1]])
+                record["gt"].append(ground_truth[gt_offsets[group]:gt_offsets[group + 1]])
             records.append(record)
     if not losses:
         raise ValueError("No evaluation batches")
-    return records, sum(losses)/len(losses)
+    # Transfer scalar losses together, preserving the original mean-of-batches.
+    losses = torch.stack(losses).cpu().tolist()
+    if not all(math.isfinite(loss) for loss in losses):
+        raise FloatingPointError("Non-finite validation/evaluation loss")
+    return records if compact else list(iter_candidate_records(records)), sum(losses)/len(losses)
 
 
 def file_sha256(path):

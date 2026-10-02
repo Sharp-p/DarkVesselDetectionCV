@@ -6,6 +6,40 @@ You do not need previous Optuna experience. Start with the synthetic smoke test,
 
 ## 1. What the components do
 
+### Performance update
+
+Fast cuDNN is now the default: benchmarking is enabled and deterministic
+algorithm selection is disabled. Seeds are still set. Use `--deterministic`
+with `search` or `calibrate-checkpoint` to opt into the slower cuDNN settings;
+`repeat` and `evaluate` inherit the saved configuration. The optional
+`--fast-cudnn` flag explicitly selects the default.
+
+Candidate extraction now finds maxima and gathers scores/coastal flags on the
+model device, transferring only sparse results to the CPU. Optuna keeps
+NumPy arrays in memory and creates Python tuples only when saving candidate
+caches. Greedy matching uses bounded NumPy distance matrices; threshold curves
+use cumulative arrays instead of a dictionary for every score. Frozen test
+metrics reuse the same curves. JSON cache schemas and detection/matching rules
+remain compatible.
+
+Loaders retain workers across epochs when `--workers` is positive. Transfers to
+the device use `non_blocking=True`; CUDA loaders already pin memory. The focal
+loss no longer branches on a GPU scalar. Worker RNG streams now continue across
+epochs, so augmentation sequences can differ from the older worker lifecycle.
+
+Each epoch logs training, validation and metric seconds, plus candidate counts;
+`history.json` also records validation patch counts. Validation timing includes
+data loading, inference, loss and candidate extraction. Training timing includes
+data loading and optimization. Checkpoint/JSON writes are outside these timings.
+Full validation, the 0.01 score floor, exact F1 selection, AP and coastal metrics
+are retained. Early models can still produce many candidates, and validation
+still requires a full inference pass. GPU throughput must be measured on your
+machine; this update was checked with the existing 15 CPU tests.
+
+**Start with a new `--study-prefix`**: the code/config hash changed, so existing
+studies intentionally reject mixing the old and new implementations. Existing
+candidate JSON caches can still be recalibrated without inference.
+
 | Component | Purpose |
 | --- | --- |
 | `tuning.py search` | Trains models with different learning rates and weight decay; records their validation scores. |

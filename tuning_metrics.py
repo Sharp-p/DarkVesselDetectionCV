@@ -5,9 +5,7 @@ AP = sum over distinct scores of (recall increase * precision), without an
 interpolated upper envelope. It is truncated at the candidate confidence floor.
 Metrics count patch instances; overlapping patches are NOT deduplicated scenes.
 """
-from bisect import bisect_right
-from itertools import groupby
-import math
+import numpy as np
 
 
 def _metrics(tp, fp, total_gt, threshold, near_shore_fp=0):
@@ -23,49 +21,82 @@ def _metrics(tp, fp, total_gt, threshold, near_shore_fp=0):
 
 class DetectionCurve:
     def __init__(self, records, channel, distance_threshold=20.0):
-        events, total_gt = [], 0
+        scores, hits, near_fp = [], [], []
+        total_gt = 0
         for record in records:
-            gt = record["gt"][channel]
+            gt = np.asarray(record["gt"][channel], dtype=np.float64).reshape(-1, 2)
+            preds = np.asarray(record["pred"][channel], dtype=np.float64).reshape(-1, 4)
             total_gt += len(gt)
-            unmatched = set(range(len(gt)))
+            if not len(preds):
+                continue
             # Stable row/column order breaks score ties within each patch.
-            preds = sorted(record["pred"][channel], key=lambda p: (-p[2], p[0], p[1]))
-            for row, col, score, near_shore in preds:
-                nearest = min(unmatched, key=lambda i: (math.hypot(row-gt[i][0], col-gt[i][1]), i), default=None)
-                is_tp = nearest is not None and math.hypot(row-gt[nearest][0], col-gt[nearest][1]) <= distance_threshold
-                if is_tp:
-                    unmatched.remove(nearest)
-                events.append((float(score), int(is_tp), int(not is_tp and near_shore)))
+            preds = preds[np.lexsort((preds[:, 1], preds[:, 0], -preds[:, 2]))]
+            hit = np.zeros(len(preds), dtype=bool)
+            unmatched = np.ones(len(gt), dtype=bool)
+            # Bound temporary distance matrices. Only nearby predictions enter
+            # the sequential greedy loop; background false positives stay arrays.
+            chunk_size = max(1, min(2048, 262144 // max(1, len(gt))))
+            for start in range(0, len(preds), chunk_size):
+                if not unmatched.any():
+                    break
+                chunk = preds[start:start + chunk_size]
+                distances = np.hypot(chunk[:, 0, None] - gt[None, :, 0],
+                                     chunk[:, 1, None] - gt[None, :, 1])
+                distances[:, ~unmatched] = np.inf
+                for index in np.flatnonzero((distances <= distance_threshold).any(axis=1)):
+                    row = distances[index]
+                    row[~unmatched] = np.inf
+                    nearest = int(row.argmin())  # first GT index wins a distance tie
+                    if unmatched[nearest] and row[nearest] <= distance_threshold:
+                        hit[start + index] = True
+                        unmatched[nearest] = False
+                    if not unmatched.any():
+                        break
+            scores.append(preds[:, 2])
+            hits.append(hit)
+            near_fp.append(~hit & preds[:, 3].astype(bool))
         self.total_gt = total_gt
-        self.rows, self.negative_scores = [], []
-        tp = fp = coastal = 0
-        ap = 0.0
-        for score, tied in groupby(sorted(events, key=lambda e: -e[0]), key=lambda e: e[0]):
-            group_tp = group_fp = 0
-            for _, hit, near in tied:
-                group_tp += hit
-                group_fp += 1 - hit
-                coastal += near
-            tp += group_tp
-            fp += group_fp
-            row = _metrics(tp, fp, total_gt, score, coastal)
-            self.rows.append(row)
-            self.negative_scores.append(-score)
-            if total_gt:
-                ap += (group_tp / total_gt) * row["precision"]
-        self.ap = ap if total_gt else None
+        values = np.concatenate(scores) if scores else np.empty(0)
+        order = np.argsort(-values, kind="stable")
+        values = values[order]
+        # Evaluate at the end of each tied score group, exactly as before.
+        ends = (np.r_[np.flatnonzero(values[:-1] != values[1:]), len(values) - 1]
+                if len(values) else np.empty(0, dtype=np.int64))
+        self.negative_scores = -values[ends]
+        hit = np.concatenate(hits)[order] if hits else np.empty(0, dtype=bool)
+        coastal = np.concatenate(near_fp)[order] if near_fp else np.empty(0, dtype=bool)
+        self._tp = np.cumsum(hit, dtype=np.int64)[ends]
+        self._fp = ends + 1 - self._tp
+        self._coastal = np.cumsum(coastal, dtype=np.int64)[ends]
+        increments = np.diff(np.r_[0, self._tp])
+        self.ap = (float(np.sum((increments / total_gt) * self._tp / (ends + 1)))
+                   if total_gt else None)
+
+    def _row(self, index, threshold):
+        return _metrics(int(self._tp[index]), int(self._fp[index]), self.total_gt,
+                        threshold, int(self._coastal[index]))
+
+    @property
+    def rows(self):
+        """Legacy inspection API; summaries avoid materializing per-score dicts."""
+        return [self._row(i, -s) for i, s in enumerate(self.negative_scores)]
 
     def at(self, threshold):
-        idx = bisect_right(self.negative_scores, -threshold) - 1
+        idx = int(np.searchsorted(self.negative_scores, -threshold, side="right")) - 1
         if idx < 0:
             return _metrics(0, 0, self.total_gt, threshold)
-        result = dict(self.rows[idx])
-        result["threshold"] = float(threshold)
-        return result
+        return self._row(idx, threshold)
 
     def best_f1(self, lower, upper):
         candidates = [self.at(lower), self.at(upper)]
-        candidates.extend(r for r in self.rows if lower <= r["threshold"] <= upper)
+        indices = np.flatnonzero((-self.negative_scores >= lower) & (-self.negative_scores <= upper))
+        if len(indices):
+            tp, fp = self._tp[indices], self._fp[indices]
+            f1 = 2.0 * tp / (tp + fp + self.total_gt)
+            # Scores descend, FP counts never decrease: the first maximum also
+            # wins both existing tie-breaks (fewer FP, then higher threshold).
+            index = int(indices[np.argmax(f1)])
+            candidates.append(self._row(index, -self.negative_scores[index]))
         # On equal F1 prefer fewer false positives, then the higher cutoff.
         return dict(max(candidates, key=lambda r: (r["f1"], -r["fp"], r["threshold"])))
 

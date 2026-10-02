@@ -27,9 +27,9 @@ from network import DarkVesselNet, FUSION_MODES
 from optimizers import DEFAULTS, OPTIMIZERS, SEARCH_SPACES, make_optimizer
 from optuna_server import client_storage
 from train import train_one_epoch
-from tuning_metrics import DetectionCurve, at_frozen_thresholds, summarize
+from tuning_metrics import DetectionCurve, summarize
 from tuning_runtime import (code_digest, collect_candidates, dataset_fingerprint,
-                            file_sha256, make_loader)
+                            file_sha256, iter_candidate_records, make_loader)
 
 SCHEMA = 1
 
@@ -46,8 +46,15 @@ def save_cache(path, records, cfg, split):
     path = Path(path)
     tmp = path.with_name(path.name + f".{os.getpid()}.tmp")
     with gzip.open(tmp, "wt") as f:
-        json.dump({"schema": SCHEMA, "split": split, "candidate_floor": cfg["min_score"],
-                   "smoke": cfg["smoke"], "records": records}, f, allow_nan=False)
+        header = {"schema": SCHEMA, "split": split, "candidate_floor": cfg["min_score"],
+                  "smoke": cfg["smoke"]}
+        f.write(json.dumps(header, allow_nan=False)[:-1] + ', "records": [')
+        # Convert one patch at a time, only when saving a selected epoch/test cache.
+        for index, record in enumerate(iter_candidate_records(records)):
+            if index:
+                f.write(", ")
+            json.dump(record, f, allow_nan=False)
+        f.write("]}")
     tmp.replace(path)
 
 
@@ -99,7 +106,7 @@ def fit_one(cfg, optimizer_name, params, seed, directory, report=None):
     """Train and choose epoch + per-class cutoffs entirely on validation data."""
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
-    config.set_seed(seed)
+    config.set_seed(seed, deterministic=cfg.get("deterministic", False))
     model = DarkVesselNet(fusion_mode=cfg["variant"]).to(cfg["device"])
     optimizer = make_optimizer(model, optimizer_name, **params)
     scheduler = (torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg["epochs"])
@@ -113,13 +120,28 @@ def fit_one(cfg, optimizer_name, params, seed, directory, report=None):
     start = time.monotonic()
     for epoch in range(1, cfg["epochs"] + 1):
         lr = optimizer.param_groups[0]["lr"]
+        epoch_start = time.monotonic()
         train_loss = train_one_epoch(model, optimizer, train_loader, device=cfg["device"],
                                      max_grad_norm=cfg["max_grad_norm"])
-        records, val_loss = collect_candidates(model, val_loader, cfg["device"], cfg["min_score"])
+        # Include queued training kernels in the training timing on accelerators.
+        if str(cfg["device"]).startswith("cuda"):
+            torch.cuda.synchronize(cfg["device"])
+        elif str(cfg["device"]).startswith("mps"):
+            torch.mps.synchronize()
+        train_seconds = time.monotonic() - epoch_start
+        validation_start = time.monotonic()
+        records, val_loss = collect_candidates(model, val_loader, cfg["device"], cfg["min_score"], compact=True)
+        validation_seconds = time.monotonic() - validation_start
+        metrics_start = time.monotonic()
         summary = summarize_cfg(records, cfg)
         score = objective_score(summary, cfg["objective"])
+        metrics_seconds = time.monotonic() - metrics_start
+        candidate_count = sum(len(p) for record in records for p in record["pred"])
         history.append({"epoch": epoch, "lr": lr, "train_loss": train_loss,
                         "val_loss": val_loss, "objective": score,
+                        "train_seconds": train_seconds, "validation_seconds": validation_seconds,
+                        "metrics_seconds": metrics_seconds, "candidate_count": candidate_count,
+                        "validation_patches": len(records),
                         "best_f1": [m["f1"] for m in summary["best_by_channel"]],
                         "thresholds": [m["threshold"] for m in summary["best_by_channel"]],
                         "ap_at_floor": summary["ap_at_floor"]})
@@ -143,7 +165,9 @@ def fit_one(cfg, optimizer_name, params, seed, directory, report=None):
         write_json(directory / "history.json", history)
         print(f"{cfg['variant']}/{optimizer_name} seed={seed} epoch={epoch}/{cfg['epochs']} "
               f"train={train_loss:.5f} val={val_loss:.5f} {cfg['objective']}={score:.5f} "
-              f"best={best_score:.5f}", flush=True)
+              f"best={best_score:.5f} | train={train_seconds:.1f}s "
+              f"validation={validation_seconds:.1f}s metrics={metrics_seconds:.2f}s "
+              f"candidates={candidate_count}", flush=True)
         if report is not None:
             report(epoch, best_score)
     save_cache(directory / "validation_candidates.json.gz", best_records, cfg, "val")
@@ -189,6 +213,7 @@ def build_cfg(args):
            "scenes": {"train": config.TRAIN_SCENES, "val": config.VAL_SCENES, "test": config.TEST_SCENES},
            "data_seed": args.data_seed, "epochs": args.epochs, "batch_size": args.batch_size,
            "workers": args.workers, "device": args.device, "smoke": args.smoke,
+           "deterministic": getattr(args, "deterministic", False),
            "scheduler": args.scheduler, "max_grad_norm": args.max_grad_norm,
            "objective": args.objective, "min_score": args.min_score,
            "threshold_min": args.threshold_min, "threshold_max": args.threshold_max,
@@ -351,6 +376,7 @@ def run_calibrate(args):
 def run_calibrate_checkpoint(args):
     """Calibrate an existing legacy checkpoint without retraining or loading test data."""
     cfg = dict(build_cfg(args), variant=args.variant)
+    config.set_seed(args.seed, deterministic=cfg["deterministic"])
     out = Path(args.output).resolve()
     if out.exists() and any(out.iterdir()):
         raise ValueError("Calibration output must be new/empty")
@@ -361,7 +387,7 @@ def run_calibrate_checkpoint(args):
     model = DarkVesselNet(fusion_mode=args.variant).to(cfg["device"])
     model.load_state_dict(checkpoint["model_state_dict"])
     records, loss = collect_candidates(model, make_loader(cfg, "val", cfg["data_seed"]),
-                                       cfg["device"], cfg["min_score"])
+                                       cfg["device"], cfg["min_score"], compact=True)
     summary = summarize_cfg(records, cfg)
     thresholds = [m["threshold"] for m in summary["best_by_channel"]]
     shutil.copyfile(args.checkpoint, out/"best.pt")
@@ -403,15 +429,16 @@ def run_evaluate(args):
         if file_sha256(checkpoint_path) != selection["checkpoint_sha256"]:
             raise ValueError("Selected checkpoint changed after validation")
         cfg["device"] = args.device
+        config.set_seed(selection["seed"], deterministic=cfg.get("deterministic", False))
         checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
         model = DarkVesselNet(fusion_mode=cfg["variant"]).to(cfg["device"])
         model.load_state_dict(checkpoint["model_state_dict"])
         test_fingerprint = dataset_fingerprint(cfg, ("test",))
         test_loader = make_loader(cfg, "test", cfg["data_seed"])
-        records, loss = collect_candidates(model, test_loader, cfg["device"], cfg["min_score"])
-        frozen = at_frozen_thresholds(records, selection["thresholds"], cfg["match_distance"])
-        fixed = at_frozen_thresholds(records, [0.3, 0.3], cfg["match_distance"])
+        records, loss = collect_candidates(model, test_loader, cfg["device"], cfg["min_score"], compact=True)
         curves = [DetectionCurve(records, c, cfg["match_distance"]) for c in range(2)]
+        frozen = [curve.at(selection["thresholds"][c]) for c, curve in enumerate(curves)]
+        fixed = [curve.at(0.3) for curve in curves]
         sweep_thresholds = sorted(set([cfg["min_score"], 0.3, *selection["thresholds"],
                                       *[i/100 for i in range(1, 100) if i/100 >= cfg["min_score"]]]))
         result = {"seed": run["seed"], "variant": cfg["variant"], "optimizer": selection["optimizer_name"],
@@ -487,6 +514,11 @@ def parser():
     s.add_argument("--batch-size", type=int, default=config.BATCH_SIZE)
     s.add_argument("--workers", type=int, default=config.NUM_WORKERS)
     s.add_argument("--device", default=str(config.DEVICE))
+    cudnn = s.add_mutually_exclusive_group()
+    cudnn.add_argument("--fast-cudnn", dest="deterministic", action="store_false", default=False,
+                       help="Enable cuDNN benchmarking and allow nondeterministic kernels (default)")
+    cudnn.add_argument("--deterministic", action="store_true",
+                       help="Opt into deterministic cuDNN algorithms and disable benchmarking")
     s.add_argument("--cpu-threads", type=int, default=4)
     s.add_argument("--data-dir", default=config.DATA_DIR)
     s.add_argument("--labels")
@@ -534,6 +566,11 @@ def parser():
     x.add_argument("--batch-size", type=int, default=config.BATCH_SIZE)
     x.add_argument("--workers", type=int, default=config.NUM_WORKERS)
     x.add_argument("--device", default=str(config.DEVICE))
+    cudnn = x.add_mutually_exclusive_group()
+    cudnn.add_argument("--fast-cudnn", dest="deterministic", action="store_false", default=False,
+                       help="Enable cuDNN benchmarking and allow nondeterministic kernels (default)")
+    cudnn.add_argument("--deterministic", action="store_true",
+                       help="Opt into deterministic cuDNN algorithms and disable benchmarking")
     x.add_argument("--cpu-threads", type=int, default=4)
     x.add_argument("--min-score", type=float, default=0.01)
     x.add_argument("--threshold-min", type=float, default=0.01)
