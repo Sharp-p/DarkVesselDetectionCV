@@ -7,6 +7,7 @@ and learning rate scheduling, and periodic validation logging.
 """
 
 import os
+import math
 import torch
 import torch.nn as nn
 from globals import (
@@ -34,10 +35,14 @@ def train_one_epoch(model, optimizer, batches, device=DEVICE, max_grad_norm=1.0)
         optimizer.zero_grad()
         pred = model(inputs)
         loss = focal_loss(pred, targets)
+        if not torch.isfinite(loss):
+            raise FloatingPointError("Non-finite training loss")
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
         optimizer.step()
         epoch_losses.append(loss.item())
+    if not epoch_losses:
+        raise ValueError("Training loader has no batches")
     return sum(epoch_losses) / len(epoch_losses)
 
 
@@ -51,6 +56,8 @@ def validate(model, batches, device=DEVICE):
             pred = model(inputs)
             loss = focal_loss(pred, targets)
             epoch_losses.append(loss.item())
+    if not epoch_losses or not all(math.isfinite(x) for x in epoch_losses):
+        raise ValueError("Validation loader is empty or has non-finite losses")
     return sum(epoch_losses) / len(epoch_losses)
 
 

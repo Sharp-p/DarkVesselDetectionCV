@@ -1,5 +1,8 @@
 # Dark Vessel Detection via Multimodal SAR & Context-Guided Cross-Attention (CGCAM)
 
+**Optimizer and threshold tuning:** see [TUNING_README.md](TUNING_README.md) for Linux setup, Optuna Server/dashboard, AdamW/Adam/SGD/RMSprop/Lion studies, validation F1 searches, and frozen test evaluation. The original `run_ablation_study.py` is retained as a legacy fixed-setting workflow; use `tuning.py` for the new experiments.
+
+
 **Master's Course in Computer Vision (A.Y. 2025–2026)**  
 **ALCOR Lab, Department of Computer, Control and Management Engineering (DIAG)**  
 **Sapienza University of Rome**  

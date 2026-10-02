@@ -1,0 +1,14 @@
+# Install a CPU/CUDA PyTorch wheel separately first; see TUNING_README.md.
+torch>=2.4,<3
+numpy>=1.26,<3
+pandas>=2.0,<3
+scipy>=1.11,<2
+tifffile>=2024.2
+opencv-python-headless>=4.9,<5
+matplotlib>=3.8,<4
+# Keep storage server, workers, and dashboard on the same Optuna release.
+optuna==4.5.0
+optuna-dashboard==0.19.0
+grpcio>=1.63,<2
+protobuf>=5.26,<7
+pytest>=8,<10

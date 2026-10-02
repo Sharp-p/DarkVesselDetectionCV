@@ -236,7 +236,7 @@ class DarkVesselNet(nn.Module):
         # Bias initialization for focal loss stability: init bias to -2.19 (prob ~ 0.1)
         nn.init.constant_(self.heatmap_head[-1].bias, -2.19)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, return_logits: bool = False):
         """
         Args:
             x: Normalized input (B, 5, H, W), shared by every fusion mode.
@@ -287,7 +287,8 @@ class DarkVesselNet(nn.Module):
 
         # Numerical clamping to prevent log(0) in Focal Loss
         heatmap = torch.clamp(heatmap, min=1e-4, max=1.0 - 1e-4)
-        return heatmap
+        # Keep the existing training API; tuning detects peaks on unclamped logits.
+        return (heatmap, logits.float()) if return_logits else heatmap
 
 
 if __name__ == "__main__":
