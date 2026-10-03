@@ -6,20 +6,54 @@ https://arxiv.org/abs/2302.06675 (small independent implementation).
 import torch
 
 OPTIMIZERS = ("adamw", "adam", "sgd", "rmsprop", "lion")
-# Initial search domains, not claims about optimal settings for this dataset.
-SEARCH_SPACES = {
+
+# v1 domains (pilot-v1/pilot-v2/full-v1 studies). Kept for reference/reproduction
+# via a --search-space JSON; they are no longer the default.
+SEARCH_SPACES_V1 = {
     "adamw": {"lr": [3e-5, 3e-4], "weight_decay": [0.0, 1e-4, 1e-3, 1e-2, 1e-1]},
     "adam": {"lr": [3e-5, 3e-4], "weight_decay": [0.0]},
     "sgd": {"lr": [1e-3, 1e-2], "weight_decay": [0.0, 1e-5, 1e-4, 1e-3]},
     "rmsprop": {"lr": [1e-4, 1e-3], "weight_decay": [0.0, 1e-5, 1e-4, 1e-3]},
     "lion": {"lr": [1e-5, 1e-4], "weight_decay": [0.0, 1e-3, 1e-2, 3e-2, 1e-1, 3e-1]},
 }
+
+# v2 domains, refined from the 59 completed full-v1/pilot-v2 trials (30 epochs,
+# batch 16, cosine, vessel-F1). See SEARCH_REFINEMENT.md for the evidence:
+#  * AdamW/Adam: lr <= 4e-5 underfits in 30 epochs (0.55-0.66 F1); 5e-5..6e-5 gives
+#    0.88-0.93; best runs are 1.5e-4..2.9e-4 and CGCAM's best sat on the old 3e-4
+#    ceiling -> [5e-5, 1e-3].
+#  * SGD: best 5.5e-3..9.9e-3, i.e. at the old 1e-2 ceiling -> [3e-3, 5e-2].
+#  * RMSprop: flat 1.1e-4..7.6e-4, best 1.34e-4 near the floor -> [5e-5, 1e-3].
+#  * Lion: all runs with lr <= 2.2e-5 peaked by epoch 1-6; the only reliable
+#    runs were 9.5e-5..9.9e-5 at the old ceiling -> [5e-5, 1e-3].
+#  * Weight decay showed no effect larger than replicate noise (+/-0.02 F1) for
+#    any optimizer, so choices are trimmed to spend trials on the learning rate.
+SEARCH_SPACES = {
+    "adamw": {"lr": [5e-5, 1e-3], "weight_decay": [0.0, 1e-2, 1e-1, 3e-1]},
+    "adam": {"lr": [5e-5, 1e-3], "weight_decay": [0.0]},
+    "sgd": {"lr": [3e-3, 5e-2], "weight_decay": [0.0, 1e-4, 1e-3]},
+    "rmsprop": {"lr": [5e-5, 1e-3], "weight_decay": [0.0, 1e-4, 1e-3]},
+    "lion": {"lr": [5e-5, 1e-3], "weight_decay": [0.0, 1e-3, 1e-2, 1e-1]},
+}
+
+# Literature/reference starting points (used by v1).
 DEFAULTS = {
     "adamw": {"lr": 1e-4, "weight_decay": 1e-2},
     "adam": {"lr": 1e-4, "weight_decay": 0.0},
     "sgd": {"lr": 3e-3, "weight_decay": 1e-4},
     "rmsprop": {"lr": 3e-4, "weight_decay": 0.0},
     "lion": {"lr": 3e-5, "weight_decay": 3e-2},
+}
+
+# Warm starts for v2: each optimizer's best full-v1 (sar_only) configuration,
+# rounded. Enqueued once per optimizer so every optimizer is evaluated at its
+# current incumbent (with the new multi-seed objective) before TPE explores.
+WARM_STARTS = {
+    "adamw": {"lr": 1.5e-4, "weight_decay": 1e-2},   # full-v1 #1: 0.947
+    "adam": {"lr": 1e-4, "weight_decay": 0.0},       # full-v1 #0: 0.937
+    "sgd": {"lr": 8e-3, "weight_decay": 0.0},        # full-v1 #9: 0.939
+    "rmsprop": {"lr": 1.3e-4, "weight_decay": 1e-3},  # full-v1 #6: 0.942
+    "lion": {"lr": 1e-4, "weight_decay": 1e-3},      # full-v1 #7: 0.920
 }
 
 

@@ -4,6 +4,19 @@ This guide runs **Optuna studies for AdamW, Adam, SGD + Nesterov momentum, RMSpr
 
 You do not need previous Optuna experience. Start with the synthetic smoke test, then calibrate existing checkpoints or run a small real-data study. The original training/evaluation entry points remain available; `tuning.py` is the new tuning workflow.
 
+## 0. v2 update: one study per variant, refined ranges, fd-exhaustion fix
+
+**What changed and why** (evidence in [`SEARCH_REFINEMENT.md`](SEARCH_REFINEMENT.md); re-run it on any database with `python analyze_optuna_db.py tuning_runs/optuna.db`):
+
+- **Optimizers compete inside one study per variant** (`<prefix>__<variant>`), with `optimizer` as a categorical hyperparameter and conditional `<optimizer>_lr` / `<optimizer>_weight_decay` parameters. A balanced round-robin phase (`--min-trials-per-optimizer`, default 4) starts each optimizer at its best v1 configuration. After that, TPE spends the rest of `--trials` where it looks best.
+- **Refined ranges**: several v1 learning-rate bounds were binding (SGD, Lion and CGCAM-AdamW optima sat on the ceiling). Lion below ~2e-5 never trained, and weight decay showed no effect beyond noise. See the table in §7.
+- **Two seeds per trial by default.** Identical v1 configs differed by up to 0.03 F1 between replicate runs (and up to 0.49 for Lion), so single-seed rankings of the top optimizers are noise.
+- **`tuning.py compare`** retrains every optimizer's selected configuration on shared fresh seeds. This is the unbiased ranking to report.
+- **"OSError: Too many open files" fix**: loader workers are shut down deterministically, even when a trial is pruned or diverges (this leaked about 20 fds and 4 processes per interrupted trial at `--workers 2`). The soft open-file limit is raised, and `file_system` tensor sharing is used. Datasets are built once per process, and fd counts are logged. If fds still grow, or a trial hits EMFILE, the trial is retried and the command **re-executes itself and resumes automatically**.
+- Divergence (NaN loss) now scores 0 for that seed instead of FAIL, so TPE learns to avoid it. FAIL trials no longer consume the budget.
+
+**Use a new `--study-prefix`** (e.g. `cmp-v1`). The code hash, study layout and ranges changed. Your v1 studies stay in the same database untouched.
+
 ## 1. What the components do
 
 ### Performance update
@@ -44,12 +57,14 @@ candidate JSON caches can still be recalibrated without inference.
 | --- | --- |
 | `tuning.py search` | Trains models with different learning rates and weight decay; records their validation scores. |
 | Optuna **trial** | One optimizer configuration, trained for the requested epochs and seeds. |
-| Optuna **study** | A collection of trials for one model variant and one optimizer. |
+| Optuna **study** | A collection of trials for one model variant; v2 studies contain all compared optimizers (v1 studies were one optimizer each). |
 | `./optuna-server` / `optuna_server.py` | Starts the official Optuna **gRPC storage proxy**, which stores trial history in a database. |
 | Optuna Dashboard | Browser interface for trial values, parameter comparisons, intermediate scores and trial states. |
 | `tuning.py calibrate-checkpoint` | Finds validation thresholds for an existing checkpoint, without retraining. |
 | `tuning.py calibrate` | Repeats an exact F1 search on a saved validation candidate cache, without model inference. |
 | `tuning.py repeat` | Retrains a selected fixed configuration with several seeds; no new parameter search. |
+| `tuning.py compare` | Retrains each optimizer's selected configuration on the same fresh seeds; writes a paired comparison. |
+| `analyze_optuna_db.py` | Read-only summary of a study database: per-trial results, per-optimizer stats, replicate noise. |
 | `tuning.py evaluate` | Tests saved checkpoints at their frozen validation thresholds; exports both vessel and structure metrics. |
 
 **Naming:** there is no assumed third-party `pip install optuna-server` dependency here. The provided `optuna-server` executable is a small launcher for Optuna's official `run_grpc_proxy_server` API. `optuna-dashboard` is the separate official browser application. The server stores trial state; it does not train models or dispatch jobs. Training runs in the `tuning.py` process you start.
@@ -133,23 +148,23 @@ In **terminal 2**:
 ```bash
 source .venv/bin/activate
 python tuning.py search \
-  --smoke --study-prefix smoke-install \
+  --smoke --study-prefix smoke-v2 \
   --variants cgcam --optimizers adamw lion \
-  --trials 1 --epochs 2 --seeds 42 \
+  --trials 2 --min-trials-per-optimizer 1 --epochs 2 --seeds 42 \
   --device cpu --workers 0 \
   --grpc-host 127.0.0.1
 ```
 
-This runs one trial for AdamW and one for Lion on tiny **synthetic 32×32 patches**. It checks model training, checkpoint writing, numerical PR/F1 evaluation, Optuna storage and plots. The dataset is not needed. Scores from `--smoke` are installation checks, **never project results**. Smoke study prefixes must start with `smoke` so they cannot be mistaken for real runs.
+This runs one trial for AdamW and one for Lion, in a single study, on tiny **synthetic 32×32 patches**. It checks model training, checkpoint writing, numerical PR/F1 evaluation, Optuna storage and plots. The dataset is not needed. Scores from `--smoke` are installation checks, **never project results**. Smoke study prefixes must start with `smoke` so they cannot be mistaken for real runs.
 
-In the dashboard, inspect `smoke-install__cgcam__adamw` and `smoke-install__cgcam__lion`. A trial may take a few moments before it appears complete. The trial value is higher-is-better validation F1 by default.
+In the dashboard, inspect `smoke-v2__cgcam`; filter or colour trials by the `optimizer` parameter. A trial may take a few moments before it appears complete. The trial value is higher-is-better validation F1 by default.
 
 To test the full output path on synthetic data:
 
 ```bash
 python tuning.py evaluate \
-  --best tuning_runs/smoke-install__cgcam__lion/best.json \
-  --output tuning_runs/smoke-install-test \
+  --best tuning_runs/smoke-v2__cgcam/best_lion.json \
+  --output tuning_runs/smoke-v2-test \
   --device cpu --confirm-frozen
 ```
 
@@ -215,60 +230,48 @@ python tuning.py calibrate \
 
 This writes a standalone comparison and deliberately does not silently replace the frozen `selection.json`. If you decide to adopt a new interval, rerun `calibrate-checkpoint` into a new output directory with that interval. The command rejects test caches. A cache cannot recover detections below its original `--min-score`; lower that floor and regenerate candidates if needed.
 
-## 7. Start a small real-data Optuna study
+## 7. Run the optimizer-comparison study
 
-A practical first run compares AdamW and Lion for radar-only and CGCAM:
+Recommended next run (v2). This is one study per variant, with all five optimizers competing inside it:
 
 ```bash
 python tuning.py search \
-  --study-prefix pilot-v1 \
+  --study-prefix cmp-v1 \
   --variants sar_only cgcam \
-  --optimizers adamw lion \
-  --trials 5 --epochs 30 --seeds 42 \
-  --data-dir /path/to/dataset \
-  --device cuda --batch-size 16 --workers 4 \
-  --objective vessel-f1 \
-  --grpc-host 127.0.0.1
-```
-
-That is **4 studies × 5 trials = 20 training runs**, not five runs total. At 30 epochs it is 600 training epochs. One study is named, for example, `pilot-v1__cgcam__lion`. The studies get separate budgets, preventing one optimizer from consuming the others' trial allocations.
-
-To include **all four variants and all five optimizers**:
-
-```bash
-python tuning.py search \
-  --study-prefix full-v1 \
-  --variants sar_only early_fusion cgcam_no_wind cgcam \
-  --optimizers adamw adam sgd rmsprop lion \
-  --trials 10 --epochs 30 --seeds 42 \
+  --trials 30 --min-trials-per-optimizer 4 \
+  --epochs 30 --seeds 42 43 \
   --data-dir /path/to/dataset \
   --device cuda --batch-size 16 --workers 4 \
   --grpc-host 127.0.0.1
 ```
 
-This is **20 studies × 10 trials = 200 training runs**. Start smaller if time or GPU resources are limited. Every trial starts a freshly initialized model; checkpoints are not carried between optimizer trials.
+That is **2 studies × 30 trials × 2 seeds = 120 training runs** (about 2.2 min each at full-v1 speed, so roughly 4.5 h). Each study first runs 5 warm starts plus 15 round-robin trials (4 per optimizer), then 10 TPE-chosen trials. Add `early_fusion cgcam_no_wind` to `--variants` for the full ablation. Use `--seeds 42 43 44` if you can afford 50% more time. The study is named, for example, `cmp-v1__cgcam`.
 
-For a real-data installation check, use `--max-train-samples 32 --max-val-samples 32 --epochs 2` with a **new prefix**. Subsets are selected deterministically. Do not report subset checks as full-split results. `macro-f1` requires examples of both classes in validation.
+`--trials` is the shared budget of the variant's study and must be at least `--min-trials-per-optimizer × number of optimizers`. Restricting `--optimizers` (e.g. `adamw sgd lion`) gives the remaining optimizers more trials each. The same 30-epoch, batch-16, cosine protocol applies to every optimizer in a study, so their values are directly comparable.
 
-### Search parameters
+For a real-data installation check, use `--max-train-samples 32 --max-val-samples 32 --epochs 2 --trials 5 --min-trials-per-optimizer 1` with a **new prefix**. Subsets are selected deterministically. Do not report subset checks as full-split results. `macro-f1` requires examples of both classes in validation.
 
-| Optimizer | Learning-rate search (log scale) | Weight-decay choices | Other fixed settings |
-| --- | --- | --- | --- |
-| AdamW | `3e-5` to `3e-4` | `0, 1e-4, 1e-3, 1e-2, 1e-1` | betas `(0.9, 0.999)` |
-| Adam control | `3e-5` to `3e-4` | `0` | betas `(0.9, 0.999)` |
-| SGD | `1e-3` to `1e-2` | `0, 1e-5, 1e-4, 1e-3` | momentum `0.9`, Nesterov enabled |
-| RMSprop | `1e-4` to `1e-3` | `0, 1e-5, 1e-4, 1e-3` | alpha `0.99`, eps `1e-8`, momentum `0`, uncentered |
-| Lion | `1e-5` to `1e-4` | `0, 1e-3, 1e-2, 0.03, 0.1, 0.3` | betas `(0.9, 0.99)` |
+The v1 per-optimizer layout is still reproducible with the v1 code archive. `tuning_search_space_v1.json` holds its ranges if you want v2's single study over the old domains.
 
-These ranges are hypotheses, not established best values. The initial trial uses the documented reference settings if they are inside the chosen domain; Lion queues both `(3e-5, 0.03)` and `(1e-5, 0.1)`. With a budget of one trial, only the first runs. TPE uses five startup trials before adaptive sampling, so a very small pilot is mostly a screening experiment.
+### Search parameters (v2)
 
-Learning rate and decay are searched jointly. Decay is categorical so **zero is a genuine candidate**, rather than an invalid point in a log distribution. Edit a copy of `tuning_search_space.json` and supply `--search-space my_search_space.json` to change domains. Keep all five optimizer entries. For example, replace the AdamW weight-decay array with `[0.001, 0.003, 0.01, 0.03]` for a focused follow-up. Use a new study prefix when changing the space.
+| Optimizer | Learning-rate search (log scale) | Weight-decay choices | Warm start | Other fixed settings |
+| --- | --- | --- | --- | --- |
+| AdamW | `5e-5` to `1e-3` | `0, 1e-2, 1e-1, 3e-1` | `1.5e-4`, `1e-2` | betas `(0.9, 0.999)` |
+| Adam control | `5e-5` to `1e-3` | `0` | `1e-4` | betas `(0.9, 0.999)` |
+| SGD | `3e-3` to `5e-2` | `0, 1e-4, 1e-3` | `8e-3`, `0` | momentum `0.9`, Nesterov enabled |
+| RMSprop | `5e-5` to `1e-3` | `0, 1e-4, 1e-3` | `1.3e-4`, `1e-3` | alpha `0.99`, eps `1e-8`, momentum `0`, uncentered |
+| Lion | `5e-5` to `1e-3` | `0, 1e-3, 1e-2, 1e-1` | `1e-4`, `1e-3` | betas `(0.9, 0.99)` |
+
+Warm starts are each optimizer's best `full-v1` sar_only trial, rounded (`WARM_STARTS` in `optimizers.py`; disable with `--no-warm-start`). The sampler is TPE with `multivariate=True, group=True`, so each optimizer's (lr, decay) subspace is modelled separately. `--startup-trials` (default 10) random trials come before TPE adapts. Enqueued round-robin trials fix only the optimizer; lr/decay are still sampled.
+
+Learning rate and decay are searched jointly. Decay is categorical so **zero is a genuine candidate**, rather than an invalid point in a log distribution. Edit a copy of `tuning_search_space.json` and supply `--search-space my_search_space.json` to change domains. It must contain an entry for every optimizer passed to `--optimizers`. For example, replace the AdamW weight-decay array with `[0.001, 0.003, 0.01, 0.03]` for a focused follow-up. Use a new study prefix when changing the space.
 
 Adam is intentionally a no-decay control; it overlaps AdamW when AdamW selects zero decay. SGD/RMSprop use PyTorch's coupled L2-style weight decay; AdamW/Lion use decoupled decay. Their coefficients are not assumed interchangeable.
 
 For all optimizers, only matrix/kernel weights receive decay. Biases, BatchNorm affine parameters and CGCAM's scalar `gamma` are excluded. This policy differs from the legacy ablation script's decay on every parameter; record it when comparing old results. Focal-loss exponents remain `(2, 4)`, Gaussian sigma remains 2 pixels, and the matching radius remains 20 pixels. Those are not silently tuned.
 
-The default scheduler is cosine annealing over the entire trial. Use `--scheduler none` for a constant LR. `--max-grad-norm 1.0` preserves the original gradient clipping. Batch size, scheduler, epochs and augmentation are fixed within a study, not searched. Keep these comparable between optimizers. The smaller Lion LR scales the entire cosine schedule, not only its first step.
+The default scheduler is cosine annealing over the entire trial. Use `--scheduler none` for a constant LR. `--max-grad-norm 1.0` preserves the original gradient clipping. Batch size, scheduler, epochs and augmentation are fixed within a study, not searched. Keep these comparable between optimizers. Each optimizer's LR scales its entire cosine schedule, not only its first step.
 
 ## 8. How validation F1 and AP are computed
 
@@ -294,39 +297,53 @@ The existing data pipeline also maps missing `is_vessel` values to vessel, sampl
 
 ## 9. Resume, pruning and reproducibility
 
-Rerun the identical search command to resume its studies. `--trials` is the **total terminal-trial budget per study**, including COMPLETE, PRUNED and FAIL states. Increase it from 5 to 10 to add up to five more trials, rather than starting ten additional ones. Failed/pruned trials consume budget; inspect them rather than silently ignoring them.
+Rerun the identical search command to resume its studies. `--trials` is the **total COMPLETE + PRUNED budget per variant study**. Increase it from 30 to 40 to add ten more trials. FAIL trials (OOM, fd exhaustion, crashes) do **not** consume budget; `--max-failures` (default 10) stops a study that keeps failing. A seed whose loss becomes non-finite counts as **0** in that trial's mean (`diverged_seeds` in `trials.json`); such trials cannot become a `best*.json`.
 
 Optuna trial history is persistent in the database. Each trial stores checkpoints separately. The resume contract includes code hash, selected scenes, label hash, train/validation TIFF size/mtime manifests, optimizer space, seeds, scheduler and score definitions. A changed contract is rejected; use a new prefix instead of mixing incomparable results. Keep the same artifact directory when continuing a study. TIFF content is not fully hashed; do not replace rasters in place while preserving their metadata.
 
-**Resuming a study is not resuming halfway through an epoch.** Ctrl-C marks an interrupted trial failed. After a reboot/SIGKILL, the next local worker marks leftover RUNNING trials failed after acquiring the study's OS lock. Increase the trial budget if you want a replacement trial. Completed trials are retained. A trial's model weights are initialized anew; the saved optimizer state is for inspection/future extension, not automatic mid-trial recovery.
+**Resuming a study is not resuming halfway through an epoch.** Ctrl-C marks an interrupted trial failed. After a reboot/SIGKILL, the next local worker marks leftover RUNNING trials failed after acquiring the study's OS lock and **queues one retry with identical parameters**, so the balanced phase stays balanced.
 
-One local worker per study is supported. A filesystem lock prevents accidental duplicate workers using its artifact directory. Parallelize *different* studies on separate GPUs rather than two workers on one study. Example:
+**Automatic restart.** Before each trial the worker compares its open-fd count with the count at start-up. If it has grown past `--fd-restart-fraction` (default 0.5) of the remaining headroom, or a trial fails with "Too many open files", the worker does three things. It marks that trial FAIL and queues a retry. It writes all study outputs. Then it **re-executes the same command**, which resumes from storage with a clean descriptor table (at most 20 times; the count is printed as `AUTO-RESTART n/20`). Use `--no-auto-restart` to stop instead. Each epoch line ends with `fds=<count>`. `history.json` and `trials.json` record `open_fds`, so a remaining leak is visible. Completed trials are retained. A trial's model weights are initialized anew; the saved optimizer state is for inspection/future extension, not automatic mid-trial recovery.
+
+One local worker per study is supported. A filesystem lock prevents accidental duplicate workers using its artifact directory. Parallelize *different variants* on separate GPUs rather than two workers on one study. Example:
 
 ```bash
 # Terminal 2, GPU 0
-CUDA_VISIBLE_DEVICES=0 python tuning.py search --study-prefix full-v1 \
-  --variants cgcam --optimizers adamw --trials 10 --epochs 30 \
+CUDA_VISIBLE_DEVICES=0 python tuning.py search --study-prefix cmp-v1 \
+  --variants sar_only --trials 30 --seeds 42 43 \
   --data-dir /path/to/dataset --device cuda --grpc-host 127.0.0.1
 
 # Terminal 3, GPU 1
-CUDA_VISIBLE_DEVICES=1 python tuning.py search --study-prefix full-v1 \
-  --variants cgcam --optimizers lion --trials 10 --epochs 30 \
+CUDA_VISIBLE_DEVICES=1 python tuning.py search --study-prefix cmp-v1 \
+  --variants cgcam --trials 30 --seeds 42 43 \
   --data-dir /path/to/dataset --device cuda --grpc-host 127.0.0.1
 ```
 
 The per-study `best.json` and `trials.json` are authoritative. The prefix-level summary only lists the studies handled by that invocation and may be replaced by another invocation using the same prefix.
 
-Pruning is **off by default** so optimizers receive the same full epoch budget. Add `--prune` only for exploratory screening; the median pruner waits for five completed trials and ten intermediate steps. With multiple seeds, a step is one epoch within the sequential seed runs. Pruned trials may have partial checkpoints, but cannot become `best.json`. Since optimizers can learn at different speeds, confirm promising settings without pruning in a new study.
+Pruning is **off by default** so optimizers receive the same full epoch budget. In v1, several runs that finished at 0.89–0.93 were still at 0.3–0.6 at epochs 10–15. Optimizers also learn at different speeds (SGD is fast early, Adam(W) late), so a median pruner in a mixed study is biased. If you add `--prune` anyway, it waits for the whole balanced phase and one full seed (`--epochs` steps). With multiple seeds, a step is one epoch within the sequential seed runs. Pruned trials may have partial checkpoints, but cannot become `best.json`. Since optimizers can learn at different speeds, confirm promising settings without pruning in a new study.
 
 Training seeds initialize Python, NumPy and Torch. Background sample coordinates use a separate fixed `--data-seed`; loader shuffle and workers have explicitly seeded generators. Every optimizer sees the same sampling protocol. This fixes the earlier unseeded `RandomState(None)` behavior. GPU kernels and package/device differences can still prevent bitwise equality. Optuna resumes trial history, not the exact sampler RNG stream of an uninterrupted process; fixed trial parameters and seeds are the unit of reproducibility.
 
-## 10. Repeat finalists with several seeds
+## 10. Confirm the optimizer ranking, then repeat finalists
 
-Choose candidates using validation results. Then repeat the selected configuration, for example:
+A study's per-optimizer best is a maximum over a *different number* of noisy trials per optimizer, so it favours whichever optimizer TPE sampled most. Before reporting a ranking, retrain each optimizer's selected configuration on the **same fresh seeds**:
+
+```bash
+python tuning.py compare \
+  --study-dir tuning_runs/cmp-v1__cgcam \
+  --seeds 101 102 103 \
+  --device cuda \
+  --output tuning_runs/cmp-v1__cgcam-confirm
+```
+
+This writes `comparison.json`, `comparison.csv` and `comparison.png`: per optimizer, the per-seed scores, mean, sample std, and the **paired difference vs. the leader** over the shared seeds. Each `<optimizer>/best.json` is a normal manifest for `evaluate`. Re-running the same command reuses optimizers that already finished. Use seeds not used during search (the command warns otherwise). `--optimizers` restricts the comparison.
+
+To retrain a single configuration:
 
 ```bash
 python tuning.py repeat \
-  --best tuning_runs/pilot-v1__cgcam__lion/best.json \
+  --best tuning_runs/cmp-v1__cgcam/best_lion.json \
   --seeds 43 44 45 \
   --device cuda \
   --output tuning_runs/final-cgcam-lion
@@ -334,7 +351,7 @@ python tuning.py repeat \
 
 This fixes LR and decay and retrains with fresh seeds. Each seed chooses its checkpoint and thresholds using validation. It writes a new `best.json` listing **all** repeated runs, not just the most favorable seed. The original dataset paths and budget are retained. Compare all reported seeds; do not pick one based on test performance.
 
-Alternatively, pass `--seeds 42 43 44` during `search`. Every trial then trains three models and Optuna maximizes their mean validation objective. This is more expensive. Standard deviation is the **sample** standard deviation (`n-1`); a single run reports `null`, not zero.
+`search` uses `--seeds 42 43` by default: every trial trains two models and Optuna maximizes their mean validation objective. `--seeds 42 43 44` is more robust and 50% more expensive. Standard deviation is the **sample** standard deviation (`n-1`); a single run reports `null`, not zero.
 
 With only one validation scene, large searches can overfit that scene. Keep the search budget proportionate, use matched budgets across variants, and report this limitation.
 
@@ -344,7 +361,7 @@ After selecting optimizer, architecture, checkpoint-selection rule and threshold
 
 ```bash
 python tuning.py evaluate \
-  --best tuning_runs/final-cgcam-lion/best.json \
+  --best tuning_runs/cmp-v1__cgcam-confirm/lion/best.json \
   --device cuda \
   --output tuning_runs/test-final-cgcam-lion \
   --confirm-frozen
@@ -367,10 +384,14 @@ Coastal outputs include the number of unmatched detections within 5 km of shore 
 For a study, outputs look like:
 
 ```text
-tuning_runs/pilot-v1__cgcam__lion/
+tuning_runs/cmp-v1__cgcam/
   contract.json
-  trials.json
-  best.json
+  trials.json                  # every trial: optimizer, lr, decay, seed scores, fds, failures
+  best.json                    # overall best trial
+  best_adamw.json ... best_lion.json   # best trial per optimizer (inputs to compare/repeat/evaluate)
+  optimizer_comparison.json    # per optimizer: n, best, top-3 mean, median, worst, failures
+  optimizer_comparison.csv
+  optimizer_comparison.png     # values per optimizer + lr-vs-objective
   trial_00000/
     result.json
     seed_42/
@@ -398,12 +419,14 @@ Final evaluation adds `summary.json`, `metrics.csv`, and per-seed `test_metrics.
 | Missing scene or `labels.csv` | Check `--data-dir`, `--labels`, scene directory names and required rasters. |
 | TIFF cannot be memory mapped | Check the source files' encoding. The original data reader requires a memmappable TIFF layout. |
 | Worker process crash | Try `--workers 0` with a new prefix. The CLI has an import-safe main guard. |
+| `OSError: [Errno 24] Too many open files` / training hangs at the start of a trial | Handled automatically in v2 (retry + restart, see §9). If `AUTO-RESTART` keeps appearing, check the `fds=` trend in the log and raise the hard limit (`ulimit -Hn`, or `/etc/security/limits.conf`). The start-up line `Open-file limit:` shows the limit in effect. `--sharing-strategy file_descriptor` restores PyTorch's default. |
 | gRPC connection timeout | Start `optuna_server.py`; check host/port and that all terminals use the same environment. |
 | Empty dashboard | Verify its database URL and working directory match the server's, and a search has started. |
 | `Address already in use` | Stop the other service or change `--port` / `--dashboard-port`; set the worker's `--grpc-port` accordingly. |
 | `database is locked` | Use one local worker at a time initially. SQLite has a 60-second timeout; for sustained concurrency use PostgreSQL. |
 | Contract mismatch | Keep the previous study intact and choose a new prefix for changed code, seeds, data, settings or search ranges. |
-| Search reports no additional trials | The total terminal-trial budget has already been reached; increase `--trials`. |
+| Search reports no additional trials | The COMPLETE/PRUNED budget has already been reached; increase `--trials`. |
+| `--trials ... cannot give N optimizers` | Raise `--trials` or lower `--min-trials-per-optimizer`. |
 | No vessel/structure GT | Remove/reconsider tiny validation subsets; `macro-f1` needs both classes. |
 | F1 threshold lies at a search boundary | Inspect the validation curve. Expand the interval and, if needed, lower the cache floor in a new experiment. |
 | Single-run standard deviation is null | Expected: one run cannot estimate variability. Use `repeat`. |
@@ -418,4 +441,4 @@ For PostgreSQL, provision a database/user locally, install `psycopg2-binary`, an
 - [Lion paper](https://arxiv.org/abs/2302.06675) and [authors' tuning guidance](https://github.com/google/automl/tree/master/lion)
 - [AdamW paper](https://arxiv.org/abs/1711.05101)
 
-The tests cover Lion updates/state loading, all optimizer factories, decay exclusions, exact F1/AP math including tied scores, agreement with independent greedy matching, logit peak extraction, deterministic background sampling, and validation/test separation. Synthetic end-to-end runs exercise the CLI, database/server and artifact paths. They do not establish performance on real SAR data.
+`tests/test_search_v2.py` covers the single-study comparison, balanced plan, warm starts, conditional parameter domains, fd-exhaustion retry and auto-restart, divergence scoring, abandoned-trial retry, contract rejection, and the regression that interrupted trials release their loader workers. The original tests cover Lion updates/state loading, all optimizer factories, decay exclusions, exact F1/AP math including tied scores, agreement with independent greedy matching, logit peak extraction, deterministic background sampling, and validation/test separation. Synthetic end-to-end runs exercise the CLI, database/server and artifact paths. They do not establish performance on real SAR data.

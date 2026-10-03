@@ -1,7 +1,9 @@
-"""Seeded loaders, synthetic smoke data, and sparse detection caching."""
+"""Seeded loaders, synthetic smoke data, sparse detection caching and fd hygiene."""
+import errno
 import hashlib
 import json
 import math
+import os
 import random
 from pathlib import Path
 
@@ -39,16 +41,106 @@ class SyntheticDataset(Dataset):
         return self.x[index], self.y[index]
 
 
+# ---------------------------------------------------------------------------
+# File-descriptor hygiene. A long search runs dozens of trials in one process;
+# every trial used to rebuild datasets and spawn persistent loader workers.
+# ---------------------------------------------------------------------------
+def fd_limits():
+    """(soft, hard) RLIMIT_NOFILE, or (None, None) where unsupported."""
+    try:
+        import resource
+        return resource.getrlimit(resource.RLIMIT_NOFILE)
+    except (ImportError, OSError, ValueError):
+        return None, None
+
+
+def raise_fd_limit(target=65536):
+    """Raise the soft open-file limit towards the hard limit (never above it).
+
+    Many Linux desktops default to a soft limit of 1024 with a far larger hard
+    limit; raising the soft limit needs no privileges. Returns (old, new) soft.
+    """
+    try:
+        import resource
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        want = target if hard == resource.RLIM_INFINITY else min(target, hard)
+        if soft != resource.RLIM_INFINITY and soft < want:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (want, hard))
+            return soft, want
+        return soft, soft
+    except (ImportError, OSError, ValueError):
+        return None, None
+
+
+def open_fd_count():
+    """Open descriptors of this process (Linux /proc, macOS /dev/fd) or None."""
+    for path in ("/proc/self/fd", "/dev/fd"):
+        try:
+            return len(os.listdir(path))
+        except OSError:
+            continue
+    return None
+
+
+def is_fd_exhaustion(exc):
+    """True for EMFILE/ENFILE anywhere in an exception chain, including the
+    RuntimeError that DataLoader raises when it can no longer talk to workers."""
+    seen = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        if isinstance(exc, OSError) and exc.errno in (errno.EMFILE, errno.ENFILE):
+            return True
+        if "too many open files" in str(exc).lower():
+            return True
+        exc = exc.__cause__ or exc.__context__
+    return False
+
+
+def shutdown_loader(loader):
+    """Stop a DataLoader's persistent workers and pin-memory thread *now*.
+
+    Relying on garbage collection is not enough: an exception traceback (pruning,
+    NaN loss, OOM, Ctrl-C) keeps the training frame - and therefore the loader,
+    its worker processes, pipes, queues and memmaps - alive into the next trial.
+    """
+    iterator = getattr(loader, "_iterator", None)
+    if iterator is None:
+        return
+    shutdown = getattr(iterator, "_shutdown_workers", None)
+    if shutdown is not None:
+        try:
+            shutdown()
+        except Exception:  # best effort during cleanup
+            pass
+    loader._iterator = None
+
+
+_DATASET_CACHE = {}
+
+
+def _dataset(cfg, split):
+    """Build each split's dataset once per process and reuse it across trials.
+
+    Construction parses labels, reads context rasters and runs a distance
+    transform; it is deterministic given (scenes, paths, data_seed), and the
+    dataset holds no per-trial state (SAR memmaps are opened lazily inside the
+    loader worker processes), so reuse does not change samples or augmentation.
+    """
+    if cfg["smoke"]:
+        return SyntheticDataset(split)
+    key = (split, cfg["data_dir"], cfg["labels_path"], tuple(cfg["scenes"][split]), cfg["data_seed"])
+    if key not in _DATASET_CACHE:
+        from data import DarkVesselDataset
+        _DATASET_CACHE[key] = DarkVesselDataset(cfg["scenes"][split], data_dir=cfg["data_dir"],
+                                                labels_path=cfg["labels_path"], is_train=split == "train",
+                                                sample_seed=cfg["data_seed"])
+    return _DATASET_CACHE[key]
+
+
 def make_loader(cfg, split, seed):
     if split not in ("train", "val", "test"):
         raise ValueError(split)
-    if cfg["smoke"]:
-        dataset = SyntheticDataset(split)
-    else:
-        from data import DarkVesselDataset
-        dataset = DarkVesselDataset(cfg["scenes"][split], data_dir=cfg["data_dir"],
-                                   labels_path=cfg["labels_path"], is_train=split == "train",
-                                   sample_seed=cfg["data_seed"])
+    dataset = _dataset(cfg, split)
     limit = cfg.get(f"max_{split}_samples", 0)
     if limit:
         # The selected subset is stable across optimizers and training seeds.
