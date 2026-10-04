@@ -7,32 +7,20 @@ studies required for the Project-X submission.
 """
 import os
 import json
+import gc
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import torch
-import torch.nn as nn
 
+from optimizers import make_optimizer
 from globals import (
-    NUM_CLASSES,
-    INPUT_CHANNELS,
-    PEAK_CONFIDENCE_THRESHOLD,
-    MATCH_DISTANCE_PIXELS,
-    DEVICE,
-    RESULTS_DIR,
-    MAX_DISTANCE_SHORE_METERS,
-    LEARNING_RATE,      
-    WEIGHT_DECAY,       
-    NUM_EPOCHS,         
+    PEAK_CONFIDENCE_THRESHOLD, MATCH_DISTANCE_PIXELS, DEVICE, RESULTS_DIR,
+    MAX_DISTANCE_SHORE_METERS, LEARNING_RATE, WEIGHT_DECAY, NUM_EPOCHS, set_seed,
 )
-from utils import (
-    extract_peaks,
-    match_detections_to_gt,
-    precision_recall_f1,
-    predict,
-    load_model_for_inference,  
-)
-from train import run_training  
+from utils import (extract_peaks, match_detections_to_gt, precision_recall_f1,
+                   predict, load_model_for_inference)
+from train import run_training 
 
 CHANNEL_NAMES = ["Vessel", "Fixed structure"]
 SHORE_CHANNEL_INDEX = 3
@@ -223,6 +211,7 @@ def _save_and_close(fig, save_path):
     plt.close(fig)  
     return save_path
 
+
 """Precision-recall curve for one channel, one line per model."""
 def plot_pr_curves(sweeps, channel, save_path, title=None):
     if not sweeps:
@@ -332,56 +321,95 @@ def plot_prediction_overlays(inputs, pred, target, save_dir, channel=0, max_samp
     return paths
 
 
-"""Trains and evaluates one model per fusion variant. For each variant: trains via run_training, reloads the best checkpoint, then runs evaluate_model, evaluate_near_shore_false_positives, and sweep_thresholds on the test set. Saves per-variant loss/PR curves plus one combined PR comparison figure into results_dir."""
-def run_ablation(model_factory, train_batches, val_batches, test_batches, variants=("sar_only", "early_fusion", "cgcam"), num_epochs=NUM_EPOCHS, device=DEVICE, results_dir=RESULTS_DIR):
 
+SELECTION_THRESHOLDS = (0.1, 0.2, 0.3, 0.4, 0.5)        # coarse grid used for per-epoch selection
+THRESHOLD_GRID = [i / 100 for i in range(5, 96, 5)]     # final threshold choice (validation)
+
+"""Trains and evaluates one model per fusion variant. For each variant: trains via run_training, reloads the best checkpoint, then runs evaluate_model, evaluate_near_shore_false_positives, and sweep_thresholds on the test set. Saves per-variant loss/PR curves plus one combined PR comparison figure into results_dir."""
+
+
+def run_ablation(model_factory, train_batches, val_batches, test_batches,
+                 variants=("sar_only", "early_fusion", "cgcam"),
+                 optimizer_configs=None,
+                 num_epochs=NUM_EPOCHS, device=DEVICE, results_dir=RESULTS_DIR,
+                 seed=42, max_grad_norm=1.0):
+    
     def _resolve(batches, fusion_mode):
         return batches(fusion_mode) if callable(batches) else batches
+
+    def _val_score(model, batches):
+        sweep = sweep_thresholds(model, batches, thresholds=SELECTION_THRESHOLDS, device=device)
+        return max(r["metrics"][0]["f1"] for r in sweep)
+
+    optimizer_configs = optimizer_configs or {}
+    os.makedirs(results_dir, exist_ok=True)
     results = {}
+
     for fusion_mode in variants:
-        model = model_factory(fusion_mode)
-        model.to(device)
-        optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+        set_seed(seed)
+        model = model_factory(fusion_mode).to(device)
+
+        cfg = optimizer_configs.get(fusion_mode,
+                                    {"optimizer": "adamw", "lr": LEARNING_RATE,
+                                     "weight_decay": WEIGHT_DECAY})
+        optimizer = make_optimizer(model, cfg["optimizer"],
+                                   lr=cfg["lr"], weight_decay=cfg["weight_decay"])
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
+
         variant_train = _resolve(train_batches, fusion_mode)
         variant_val = _resolve(val_batches, fusion_mode)
-        variant_test = _resolve(test_batches, fusion_mode)
-        train_hist, val_hist, best_val_loss, checkpoint_path = run_training(
+
+        train_hist, val_hist, best_val_score, checkpoint_path = run_training(
             model, optimizer, variant_train, variant_val, num_epochs,
             scheduler=scheduler, device=device,
             checkpoint_dir=os.path.join(results_dir, "checkpoints"),
             best_checkpoint_filename=f"best_{fusion_mode}.pt",
+            max_grad_norm=max_grad_norm, val_score_fn=_val_score,
         )
         if checkpoint_path is not None:
             load_model_for_inference(model, checkpoint_path, device=device)
-        test_metrics = evaluate_model(model, variant_test, device=device)
-        near_shore_metrics = evaluate_near_shore_false_positives(model, variant_test, device=device)
-        sweep = sweep_thresholds(model, variant_test, device=device)
+
+        # Threshold chosen on validation, then applied once to test.
+        val_sweep = sweep_thresholds(model, variant_val, thresholds=THRESHOLD_GRID, device=device)
+        val_f1s = [r["metrics"][0]["f1"] for r in val_sweep]
+        best_t = THRESHOLD_GRID[max(range(len(THRESHOLD_GRID)), key=val_f1s.__getitem__)]
+
+        variant_test = _resolve(test_batches, fusion_mode)
+        test_metrics = evaluate_model(model, variant_test, device=device,
+                                      confidence_threshold=best_t)
+        near_shore_metrics = evaluate_near_shore_false_positives(
+            model, variant_test, device=device, confidence_threshold=best_t)
+        sweep = sweep_thresholds(model, variant_test, device=device)  # PR plots only
 
         plot_loss_curves(train_hist, val_hist,
-                          os.path.join(results_dir, f"loss_curves_{fusion_mode}.png"),
-                          title=f"Training convergence: {fusion_mode}")
+                         os.path.join(results_dir, f"loss_curves_{fusion_mode}.png"),
+                         title=f"Training convergence: {fusion_mode}")
         plot_pr_curves({fusion_mode: sweep}, channel=0,
-                        save_path=os.path.join(results_dir, f"pr_vessel_{fusion_mode}.png"))
+                       save_path=os.path.join(results_dir, f"pr_vessel_{fusion_mode}.png"))
 
         results[fusion_mode] = {
             "train_loss_history": train_hist,
             "val_loss_history": val_hist,
-            "best_val_loss": best_val_loss,
+            "best_val_f1": best_val_score,
+            "threshold": best_t,
+            "seed": seed,
             "checkpoint_path": checkpoint_path,
             "test_metrics": test_metrics,
             "near_shore_metrics": near_shore_metrics,
             "sweep": sweep,
         }
 
+        del model, optimizer, scheduler, variant_train, variant_val, variant_test
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     plot_pr_curves({fm: r["sweep"] for fm, r in results.items()}, channel=0,
-                    save_path=os.path.join(results_dir, "pr_vessel_comparison.png"),
-                    title="Precision-recall comparison: Vessel detection")
+                   save_path=os.path.join(results_dir, "pr_vessel_comparison.png"),
+                   title="Precision-recall comparison: Vessel detection")
     table = ablation_table(results)
-    os.makedirs(results_dir, exist_ok=True)
     with open(os.path.join(results_dir, "ablation_table.json"), "w") as f:
         json.dump(table, f, indent=2)
-
     return results, table
 
 
@@ -392,6 +420,7 @@ def ablation_table(results, channel=0):
         ns = r["near_shore_metrics"][channel]
         rows.append({
             "fusion_mode": fusion_mode,
+            "threshold": r["threshold"],
             "precision": m["precision"],
             "recall": m["recall"],
             "f1": m["f1"],
@@ -399,4 +428,6 @@ def ablation_table(results, channel=0):
             "near_shore_fp": ns["near_shore_fp"],
             "near_shore_fp_rate": ns["near_shore_fp_rate"],
         })
-    return rows 
+    return rows
+    
+    

@@ -1,16 +1,13 @@
 """
 utils.py
 
-Provides utility functions, including evaluation metric computations (peak
-extraction / NMS, centroid matching, precision, recall, F1-score, circle-IoU
-localization proxy), SAR backscatter visualization routines, and checkpoint
-saving/loading helpers.
+Focal loss, peak extraction and centroid matching, precision/recall/F1,
+checkpoint saving, and single-batch inference helpers.
 """
 
 import math
 import os
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from globals import (
     FOCAL_ALPHA,
@@ -21,6 +18,7 @@ from globals import (
     CHECKPOINT_DIR,
     DEVICE,
 )
+
 
 
 def focal_loss(pred, target, alpha=FOCAL_ALPHA, beta=FOCAL_BETA, eps=1e-4):
@@ -98,25 +96,6 @@ def precision_recall_f1(tp, fp, fn, eps=1e-8):
     return precision, recall, f1
 
 
-"""IoU between two circles, used as a localization-quality proxy metric. This dataset has no ground-truth bounding boxes, only detection centroids, so classic box-IoU can't be computed directly. Representing each detection as a fixed-radius circle  gives a comparable overlap metric."""
-def circle_iou(center_a, radius_a, center_b, radius_b):
-    d = math.hypot(center_a[0] - center_b[0], center_a[1] - center_b[1])
-    r1, r2 = radius_a, radius_b
-
-    if d >= r1 + r2:
-        inter = 0.0  # circles don't overlap at all
-    elif d <= abs(r1 - r2):
-        inter = math.pi * min(r1, r2) ** 2  # smaller circle fully inside larger
-    else:
-        # standard circle-circle lens intersection formula
-        alpha = 2 * math.acos(max(-1.0, min(1.0, (d**2 + r1**2 - r2**2) / (2 * d * r1))))
-        beta = 2 * math.acos(max(-1.0, min(1.0, (d**2 + r2**2 - r1**2) / (2 * d * r2))))
-        inter = (0.5 * r1**2 * (alpha - math.sin(alpha))
-                 + 0.5 * r2**2 * (beta - math.sin(beta)))
-
-    union = math.pi * r1**2 + math.pi * r2**2 - inter
-    return inter / union if union > 0 else 0.0
-
 """ Saves model + optimizer state, current epoch, and val_loss to 'epoch_{epoch}.pt' inside checkpoint_dir """
 def save_checkpoint(model, optimizer, epoch, val_loss, checkpoint_dir=CHECKPOINT_DIR, filename=None):
     os.makedirs(checkpoint_dir, exist_ok=True)
@@ -130,14 +109,6 @@ def save_checkpoint(model, optimizer, epoch, val_loss, checkpoint_dir=CHECKPOINT
         "val_loss": val_loss,
     }, path)
     return path
-
-
-def load_checkpoint(model, optimizer, path, map_location=None):
-    checkpoint = torch.load(path, map_location=map_location, weights_only=True)
-    model.load_state_dict(checkpoint["model_state_dict"])
-    if optimizer is not None:
-        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-    return checkpoint["epoch"], checkpoint["val_loss"]
 
 
 """ Loads only the model weights from a checkpoint and puts the model in eval mode on the target device."""
