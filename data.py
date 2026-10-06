@@ -225,11 +225,13 @@ class DarkVesselDataset(Dataset):
         scene_ids: List[str],
         data_dir: str = DATA_DIR,
         labels_path: str = LABELS_PATH,
-        is_train: bool = True
+        is_train: bool = True,
+        sample_seed: int = 42
     ):
         self.scene_ids = scene_ids
         self.data_dir = data_dir
         self.is_train = is_train
+        self.sample_seed = sample_seed
 
         # Load annotations filtered by selected scene IDs
         labels_df = pd.read_csv(labels_path)
@@ -305,12 +307,12 @@ class DarkVesselDataset(Dataset):
 
         # 2. Negative Samples (50:50 ratio): sampled across ocean and coastal regions
         num_neg = len(samples)
-        rng = np.random.RandomState(42 if not self.is_train else None)
+        rng = np.random.RandomState(self.sample_seed)
         for _ in range(num_neg):
             sid = rng.choice(self.scene_ids)
             H, W = self.scene_shapes[sid]
-            r0 = rng.randint(0, H - PATCH_SIZE)
-            c0 = rng.randint(0, W - PATCH_SIZE)
+            r0 = rng.randint(0, H - PATCH_SIZE + 1)
+            c0 = rng.randint(0, W - PATCH_SIZE + 1)
             samples.append({
                 "scene_id": sid,
                 "r0": r0,

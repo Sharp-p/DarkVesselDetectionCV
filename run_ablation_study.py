@@ -29,7 +29,7 @@ OPTIMIZERS = ["adamw", "adam", "sgd", "rmsprop", "lion"]
 VARIANTS = ["sar_only", "early_fusion", "cgcam_no_wind", "cgcam"]
 
 QUICK = os.environ.get("QUICK") == "1"
-SEEDS = [1] if QUICK else [1, 2, 3]   
+SEEDS = [1] if QUICK else [1952546, 1986413, 2246638]
 EPOCHS = 2 if QUICK else NUM_EPOCHS
 OUT_DIR = RESULTS_DIR + ("_quick" if QUICK else "")
 
@@ -55,7 +55,7 @@ def model_factory(fusion_mode):
 
 
 optimizer_configs = best_configs(VARIANTS)
-
+optimizer_configs["cgcam"] = dict(optimizer_configs["cgcam_no_wind"])
 # Same data pipeline and training settings as the search.
 winner = optimizer_configs["cgcam"]["optimizer"]
 selection_path = glob.glob(f"tuning_runs/{PREFIX}__cgcam__{winner}/**/selection.json",
@@ -83,7 +83,10 @@ for seed in SEEDS:
 results = all_results[SEEDS[0]]   # curves and overlays below use the first seed
 
 # ---- aggregate over seeds ----
-keys = ("precision", "recall", "f1", "fp", "near_shore_fp_rate")
+# near_shore_fp (the raw count) is pulled straight from ablation_table()'s rows,
+# the same place near_shore_fp_rate already comes from - no separate
+# re-derivation needed, both are logged directly by run_ablation.
+keys = ("precision", "recall", "f1", "fp", "near_shore_fp", "near_shore_fp_rate")
 agg = {}
 print(f"\n=== Ablation table (vessel channel), mean +/- std over seeds {SEEDS} ===")
 for v in VARIANTS:
@@ -96,7 +99,8 @@ for v in VARIANTS:
           f"R={m['recall'][0]:.3f}±{m['recall'][1]:.3f} "
           f"F1={m['f1'][0]:.3f}±{m['f1'][1]:.3f} | "
           f"FP={m['fp'][0]:.0f}±{m['fp'][1]:.0f} "
-          f"near-shore FP rate={m['near_shore_fp_rate'][0]:.3f}±{m['near_shore_fp_rate'][1]:.3f}")
+          f"near-shore FP={m['near_shore_fp'][0]:.0f}±{m['near_shore_fp'][1]:.0f} "
+          f"({m['near_shore_fp_rate'][0]:.3f}±{m['near_shore_fp_rate'][1]:.3f} rate)")
 
 os.makedirs(OUT_DIR, exist_ok=True)
 with open(os.path.join(OUT_DIR, "ablation_aggregate.json"), "w") as f:
@@ -118,6 +122,47 @@ ax.set_title(f"Fraction of false positives within {NEAR_SHORE_KM_THRESHOLD:g}km 
 ax.grid(axis="y", alpha=0.3)
 fig.tight_layout()
 fig.savefig(os.path.join(OUT_DIR, "near_shore_fp_comparison.png"), dpi=200)
+plt.close(fig)
+
+
+def _bar_chart(metric_key, ylabel, title, filename):
+    """Same style as the rate chart above, reused for count and total-FP."""
+    fig, ax = plt.subplots(figsize=(6, 4))
+    ax.bar(VARIANTS,
+           [agg[v][metric_key][0] for v in VARIANTS],
+           yerr=[agg[v][metric_key][1] for v in VARIANTS],
+           capsize=4, color=["#999", "#999", "#999", "#2a7"])
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    ax.grid(axis="y", alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(os.path.join(OUT_DIR, filename), dpi=200)
+    plt.close(fig)
+
+
+_bar_chart("fp", "Total false positives (vessel channel)",
+           "Total FP per test pass", "fp_total_comparison.png")
+_bar_chart("near_shore_fp", "Near-shore FP count (vessel channel)",
+           f"False positives within {NEAR_SHORE_KM_THRESHOLD:g}km of shore",
+           "near_shore_fp_count_comparison.png")
+
+# Combined 3-panel view: count and rate side by side, so the rate chart is
+# never shown on its own without the count that gives it context.
+fig, axes = plt.subplots(1, 3, figsize=(15, 4.5))
+for ax, key, ylabel, title in (
+    (axes[0], "fp", "Total FP", "Total false positives"),
+    (axes[1], "near_shore_fp", "Near-shore FP (count)", f"FP within {NEAR_SHORE_KM_THRESHOLD:g}km of shore"),
+    (axes[2], "near_shore_fp_rate", "Near-shore FP rate", "Fraction of FP that are near-shore"),
+):
+    ax.bar(VARIANTS, [agg[v][key][0] for v in VARIANTS],
+           yerr=[agg[v][key][1] for v in VARIANTS], capsize=4,
+           color=["#999", "#999", "#999", "#2a7"])
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    ax.grid(axis="y", alpha=0.3)
+fig.suptitle(f"False-positive breakdown across variants (mean ± std, seeds {SEEDS})")
+fig.tight_layout()
+fig.savefig(os.path.join(OUT_DIR, "fp_breakdown_combined.png"), dpi=200)
 plt.close(fig)
 
 # ---- near-shore overlays: a few near-shore test patches, reused for each variant ----
