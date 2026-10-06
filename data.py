@@ -206,9 +206,7 @@ class SceneContextCache:
         return b_patch, d_patch, w_patch
 
 
-# -----------------------------------------------------------------------------
-# 4. PyTorch Dataset for Dark Vessel Detection
-# -----------------------------------------------------------------------------
+# PyTorch Dataset for Dark Vessel Detection
 class DarkVesselDataset(Dataset):
     """
     PyTorch Dataset for Sentinel-1 Dark Vessel Detection with CGCAM.
