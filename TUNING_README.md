@@ -1,5 +1,9 @@
 # DarkVesselNet tuning on a local Linux machine
 
+**Matched recall update:** [MATCHED_RECALL_README.md](MATCHED_RECALL_README.md) covers recall-constrained checkpoint selection and automatic total/coastal false-positive comparisons.
+
+**Performance:** [PERFORMANCE_README.md](PERFORMANCE_README.md) covers the CPU optimizations, loader controls, and epoch timing logs added in this version.
+
 **CGCAM architecture experiments:** [CGCAM_README.md](CGCAM_README.md) documents the new `--cgcam-mode`, `--gamma-init`, diagnostics, and `compare_cgcam.py` launcher. Original global attention remains the default. Use fresh study prefixes after this code update.
 
 This guide runs **Optuna studies for AdamW, Adam, SGD + Nesterov momentum, RMSprop and Lion**, searches detection thresholds using validation F1, and evaluates the selected models on test scenes only after the choices are frozen.

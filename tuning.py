@@ -27,7 +27,7 @@ from network import DarkVesselNet, FUSION_MODES, CGCAM_MODES
 from optimizers import DEFAULTS, OPTIMIZERS, SEARCH_SPACES, make_optimizer
 from optuna_server import client_storage
 from train import train_one_epoch
-from tuning_metrics import DetectionCurve, at_frozen_thresholds, summarize
+from tuning_metrics import DetectionCurve, at_frozen_thresholds, summarize, ground_truth_digest
 from tuning_runtime import (code_digest, collect_candidates, dataset_fingerprint,
                             file_sha256, make_loader)
 
@@ -45,7 +45,7 @@ def write_json(path, value):
 def save_cache(path, records, cfg, split):
     path = Path(path)
     tmp = path.with_name(path.name + f".{os.getpid()}.tmp")
-    with gzip.open(tmp, "wt") as f:
+    with gzip.open(tmp, "wt", compresslevel=1) as f:
         json.dump({"schema": SCHEMA, "split": split, "candidate_floor": cfg["min_score"],
                    "smoke": cfg["smoke"], "records": records}, f, allow_nan=False)
     tmp.replace(path)
@@ -77,9 +77,17 @@ def aggregate(values):
             "n": len(values)}
 
 
-def objective_score(summary, objective):
+def objective_score(summary, objective, target_recall=0.6, coastal_fp_weight=0.0):
     if summary["gt_counts"][0] == 0:
         raise ValueError("Validation has no vessel GT; use a larger validation subset")
+    if objective == "vessel-fp-at-recall":
+        point = next(p for p in summary["matched_recall"]
+                     if p["channel"] == 0 and p["target_recall"] == target_recall)
+        if point["status"] != "reached":
+            return point["max_recall"] - target_recall  # Always below feasible scores.
+        m = point["metrics"]
+        cost = (m["fp"] + coastal_fp_weight*m["near_shore_fp"]) / summary["gt_counts"][0]
+        return 1.0 / (1.0 + cost)
     if objective == "vessel-ap":
         return summary["ap_at_floor"][0]
     if objective == "macro-f1":
@@ -89,10 +97,18 @@ def objective_score(summary, objective):
     return summary["best_by_channel"][0]["f1"]
 
 
+def combine_seed_scores(scores, objective):
+    # One seed failing the recall constraint cannot be hidden by other seeds.
+    if objective == "vessel-fp-at-recall" and min(scores) < 0:
+        return min(scores)
+    return statistics.mean(scores)
+
+
 def summarize_cfg(records, cfg):
     return summarize(records, min_score=cfg["min_score"],
                      threshold_min=cfg["threshold_min"], threshold_max=cfg["threshold_max"],
-                     distance_threshold=cfg["match_distance"])
+                     distance_threshold=cfg["match_distance"],
+                     recall_targets=cfg.get("recall_targets", [0.5, 0.6, 0.7]))
 
 
 def build_model(cfg):
@@ -120,20 +136,28 @@ def fit_one(cfg, optimizer_name, params, seed, directory, report=None):
     for epoch in range(1, cfg["epochs"] + 1):
         lr = optimizer.param_groups[0]["lr"]
         diagnostics = {}
+        timings = {}
         train_loss = train_one_epoch(model, optimizer, train_loader, device=cfg["device"],
                                      max_grad_norm=cfg["max_grad_norm"], diagnostics=diagnostics,
-                                     diagnostics_every=cfg.get("diagnostics_every", 10))
+                                     diagnostics_every=cfg.get("diagnostics_every", 10), timings=timings)
+        stage_start = time.perf_counter()
         records, val_loss = collect_candidates(model, val_loader, cfg["device"], cfg["min_score"])
+        timings["validation_inference_seconds"] = time.perf_counter()-stage_start
+        stage_start = time.perf_counter()
         summary = summarize_cfg(records, cfg)
-        score = objective_score(summary, cfg["objective"])
+        timings["validation_metrics_seconds"] = time.perf_counter()-stage_start
+        score = objective_score(summary, cfg["objective"], cfg.get("target_recall", 0.6),
+                                cfg.get("coastal_fp_weight", 0.0))
         history.append({"epoch": epoch, "lr": lr, "train_loss": train_loss,
                         "val_loss": val_loss, "objective": score,
                         "best_f1": [m["f1"] for m in summary["best_by_channel"]],
                         "thresholds": [m["threshold"] for m in summary["best_by_channel"]],
                         "ap_at_floor": summary["ap_at_floor"],
-                        "fusion_diagnostics": diagnostics})
+                        "matched_recall": summary["matched_recall"],
+                        "fusion_diagnostics": diagnostics, "timings": timings})
         if scheduler is not None:
             scheduler.step()
+        stage_start = time.perf_counter()
         if score > best_score:
             best_score, best_epoch = score, epoch
             best_records, best_summary = records, summary
@@ -145,18 +169,25 @@ def fit_one(cfg, optimizer_name, params, seed, directory, report=None):
                 "config": cfg, "optimizer_name": optimizer_name, "params": params,
                 "model_config": model.model_config(),
                 "seed": seed, "thresholds": [m["threshold"] for m in summary["best_by_channel"]],
+                "matched_recall": summary["matched_recall"],
             }
             tmp = directory / "best.pt.tmp"
             torch.save(checkpoint, tmp)
             tmp.replace(directory / "best.pt")
             write_json(directory / "best_validation.json", summary)
+        timings["checkpoint_seconds"] = time.perf_counter()-stage_start
         write_json(directory / "history.json", history)
         diagnostic_text = (f" gamma={diagnostics['gamma_end']:.5f} "
                            f"branch/radar={diagnostics['relative_branch_norm_mean']:.4g}"
                            if diagnostics.get("enabled") else "")
         print(f"{cfg['variant']}/{optimizer_name} seed={seed} epoch={epoch}/{cfg['epochs']} "
               f"train={train_loss:.5f} val={val_loss:.5f} {cfg['objective']}={score:.5f} "
-              f"best={best_score:.5f}{diagnostic_text}", flush=True)
+              f"best={best_score:.5f}{diagnostic_text} "
+              f"train_s={timings['train_seconds']:.1f} "
+              f"data_wait_s={timings['loader_wait_seconds']:.1f} "
+              f"val_s={timings['validation_inference_seconds']:.1f} "
+              f"metrics_s={timings['validation_metrics_seconds']:.1f} "
+              f"save_s={timings['checkpoint_seconds']:.1f}", flush=True)
         if report is not None:
             report(epoch, best_score)
     save_cache(directory / "validation_candidates.json.gz", best_records, cfg, "val")
@@ -164,6 +195,7 @@ def fit_one(cfg, optimizer_name, params, seed, directory, report=None):
     selection = {"schema": SCHEMA, "checkpoint": "best.pt", "seed": seed,
                  "epoch": best_epoch, "validation_objective": best_score,
                  "thresholds": thresholds, "threshold_source": "validation",
+                 "matched_recall": best_summary["matched_recall"],
                  "checkpoint_sha256": file_sha256(directory / "best.pt"),
                  "wall_seconds": time.monotonic()-start, "config": cfg,
                  "optimizer_name": optimizer_name, "params": params}
@@ -202,11 +234,19 @@ def build_cfg(args):
            "scenes": {"train": config.TRAIN_SCENES, "val": config.VAL_SCENES, "test": config.TEST_SCENES},
            "data_seed": args.data_seed, "epochs": args.epochs, "batch_size": args.batch_size,
            "workers": args.workers, "device": args.device, "smoke": args.smoke,
+           "persistent_workers": getattr(args, "persistent_workers", True),
+           "prefetch_factor": getattr(args, "prefetch_factor", 2),
+           "loader_start_method": getattr(args, "loader_start_method", "spawn"),
+           "loader_timeout": getattr(args, "loader_timeout", 120),
            "scheduler": args.scheduler, "max_grad_norm": args.max_grad_norm,
            "cgcam_mode": getattr(args, "cgcam_mode", None) or "global",
            "gamma_init": args.gamma_init if getattr(args, "gamma_init", None) is not None else 0.0,
            "diagnostics_every": getattr(args, "diagnostics_every", 10),
            "objective": args.objective, "min_score": args.min_score,
+           "target_recall": getattr(args, "target_recall", 0.6),
+           "coastal_fp_weight": getattr(args, "coastal_fp_weight", 0.0),
+           "recall_targets": sorted(set(getattr(args, "recall_targets", [0.5, 0.6, 0.7])
+                                        + [getattr(args, "target_recall", 0.6)])),
            "threshold_min": args.threshold_min, "threshold_max": args.threshold_max,
            "match_distance": config.MATCH_DISTANCE_PIXELS,
            "max_train_samples": args.max_train_samples, "max_val_samples": args.max_val_samples,
@@ -273,7 +313,8 @@ def run_search(args):
                     try:
                         for index, seed in enumerate(args.seeds):
                             def report(epoch, best):
-                                trial.report((sum(scores)+best)/(len(scores)+1), index*args.epochs+epoch)
+                                trial.report(combine_seed_scores(scores + [best], cfg["objective"]),
+                                             index*args.epochs+epoch)
                                 if trial.should_prune():
                                     raise optuna.TrialPruned(f"Pruned after seed {seed}, epoch {epoch}")
                             selection = fit_one(contract["config"], name, params, seed,
@@ -282,12 +323,13 @@ def run_search(args):
                             runs.append({"seed": seed, "selection": f"seed_{seed}/selection.json"})
                         result = {"trial": trial.number, "optimizer_name": name, "variant": variant,
                                   "params": params, "validation_objective": aggregate(scores), "runs": runs,
+                                  "selection_score": combine_seed_scores(scores, cfg["objective"]),
                                   "config": contract["config"]}
                         write_json(trial_dir/"result.json", result)
                         trial.set_user_attr("result_file", str(trial_dir/"result.json"))
                         trial.set_user_attr("seed_scores", scores)
                         trial.set_user_attr("std", result["validation_objective"]["std"])
-                        return statistics.mean(scores)
+                        return combine_seed_scores(scores, cfg["objective"])
                     except (FloatingPointError, torch.OutOfMemoryError) as exc:
                         trial.set_user_attr("failure_reason", str(exc))
                         raise
@@ -355,7 +397,7 @@ def run_calibrate(args):
         raise ValueError("Threshold selection is allowed on validation caches only")
     summary = summarize(cache["records"], min_score=cache["candidate_floor"],
                         threshold_min=args.threshold_min, threshold_max=args.threshold_max,
-                        distance_threshold=args.match_distance)
+                        distance_threshold=args.match_distance, recall_targets=args.recall_targets)
     write_json(args.output, {"schema": SCHEMA, "threshold_source": "validation",
                             "cache_sha256": file_sha256(args.cache),
                             "thresholds": [m["threshold"] for m in summary["best_by_channel"]],
@@ -398,6 +440,7 @@ def run_calibrate_checkpoint(args):
                  "epoch": checkpoint.get("epoch"), "epoch_convention": "copied_from_external_checkpoint",
                  "validation_objective": objective_score(summary, cfg["objective"]),
                  "val_loss": loss, "thresholds": thresholds, "threshold_source": "validation",
+                 "matched_recall": summary["matched_recall"],
                  "checkpoint_sha256": file_sha256(out/"best.pt"), "config": cfg,
                  "optimizer_name": "external_checkpoint", "params": {}}
     write_json(out/"selection.json", selection)
@@ -436,9 +479,17 @@ def run_evaluate(args):
         test_fingerprint = dataset_fingerprint(cfg, ("test",))
         test_loader = make_loader(cfg, "test", cfg["data_seed"])
         records, loss = collect_candidates(model, test_loader, cfg["device"], cfg["min_score"])
-        frozen = at_frozen_thresholds(records, selection["thresholds"], cfg["match_distance"])
-        fixed = at_frozen_thresholds(records, [0.3, 0.3], cfg["match_distance"])
         curves = [DetectionCurve(records, c, cfg["match_distance"]) for c in range(2)]
+        frozen = [curve.at(t) for curve, t in zip(curves, selection["thresholds"])]
+        fixed = [curve.at(0.3) for curve in curves]
+        matched_recall = []
+        for point in selection.get("matched_recall", []):
+            frozen_point = dict(point, validation_metrics=point["metrics"], metrics=None)
+            if point["status"] == "reached":
+                metrics = curves[point["channel"]].at(point["threshold"])
+                frozen_point.update(metrics=metrics,
+                                    test_target_met=metrics["recall"] + 1e-12 >= point["target_recall"])
+            matched_recall.append(frozen_point)
         sweep_thresholds = sorted(set([cfg["min_score"], 0.3, *selection["thresholds"],
                                       *[i/100 for i in range(1, 100) if i/100 >= cfg["min_score"]]]))
         result = {"seed": run["seed"], "variant": cfg["variant"], "optimizer": selection["optimizer_name"],
@@ -447,9 +498,14 @@ def run_evaluate(args):
                   "scope": "sampled_patch_instances_not_scene_level", "num_patches": len(records),
                   "threshold_source": "validation", "thresholds": selection["thresholds"],
                   "frozen_threshold_metrics": frozen, "fixed_0_3": fixed,
+                  "matched_recall": matched_recall,
+                  "comparison_config": {k: cfg.get(k) for k in (
+                      "scenes", "data_seed", "match_distance", "min_score", "smoke", "code_sha256")},
+                  "checkpoint_sha256": selection["checkpoint_sha256"],
                   "candidate_floor": cfg["min_score"], "ap_at_floor": [c.ap for c in curves],
                   "ap_definition": "non_interpolated_grouped_score_detection_AP_above_candidate_floor",
                   "gt_counts": [c.total_gt for c in curves], "test_data_fingerprint": test_fingerprint,
+                  "ground_truth_sha256": ground_truth_digest(records),
                   "sweep": [{"threshold": t, "metrics": [c.at(t) for c in curves]} for t in sweep_thresholds]}
         # Deliberately no test argmax-F1: operating points remain frozen.
         seed_dir = out/f"seed_{run['seed']}"
@@ -461,7 +517,7 @@ def run_evaluate(args):
     aggregate_results = []
     for channel, name in enumerate(("vessel", "structure")):
         row = {"channel": name}
-        for metric in ("precision", "recall", "f1", "near_shore_fp"):
+        for metric in ("precision", "recall", "f1", "tp", "fp", "fn", "near_shore_fp"):
             row[metric] = aggregate([r["frozen_threshold_metrics"][channel][metric] for r in all_results])
         ap_values = [r["ap_at_floor"][channel] for r in all_results]
         row["ap_at_floor"] = aggregate(ap_values) if all(a is not None for a in ap_values) else None
@@ -520,6 +576,13 @@ def parser():
     s.add_argument("--data-seed", type=int, default=42)
     s.add_argument("--batch-size", type=int, default=config.BATCH_SIZE)
     s.add_argument("--workers", type=int, default=config.NUM_WORKERS)
+    s.add_argument("--persistent-workers", action=argparse.BooleanOptionalAction, default=True,
+                   help="Keep loader processes and scene memmaps alive between epochs")
+    s.add_argument("--prefetch-factor", type=int, default=2,
+                   help="Batches prefetched per loader worker; ignored with --workers 0")
+    s.add_argument("--loader-start-method", choices=("spawn", "fork", "forkserver"), default="spawn")
+    s.add_argument("--loader-timeout", type=int, default=120,
+                   help="Seconds before reporting a stalled loader worker; 0 waits indefinitely")
     s.add_argument("--device", default=str(config.DEVICE))
     s.add_argument("--cpu-threads", type=int, default=4)
     s.add_argument("--data-dir", default=config.DATA_DIR)
@@ -529,7 +592,13 @@ def parser():
     s.add_argument("--grpc-host", help="Use the optuna-server storage proxy instead of direct SQL")
     s.add_argument("--grpc-port", type=int, default=13000)
     s.add_argument("--search-space", help="JSON overriding the documented optimizer search spaces")
-    s.add_argument("--objective", choices=("vessel-f1", "macro-f1", "vessel-ap"), default="vessel-f1")
+    s.add_argument("--objective", choices=("vessel-f1", "macro-f1", "vessel-ap", "vessel-fp-at-recall"), default="vessel-f1")
+    s.add_argument("--target-recall", type=float, default=0.6,
+                   help="Vessel recall constraint for vessel-fp-at-recall selection")
+    s.add_argument("--coastal-fp-weight", type=float, default=0.0,
+                   help="Extra cost for a coastal FP; cost=FP+weight*coastal_FP")
+    s.add_argument("--recall-targets", nargs="+", type=float, default=[0.5, 0.6, 0.7],
+                   help="Validation recall operating points to save and freeze for test")
     s.add_argument("--scheduler", choices=("cosine", "none"), default="cosine")
     s.add_argument("--max-grad-norm", type=float, default=1.0)
     s.add_argument("--min-score", type=float, default=0.01)
@@ -557,6 +626,7 @@ def parser():
     c.add_argument("--threshold-min", type=float, default=0.01)
     c.add_argument("--threshold-max", type=float, default=0.95)
     c.add_argument("--match-distance", type=float, default=config.MATCH_DISTANCE_PIXELS)
+    c.add_argument("--recall-targets", nargs="+", type=float, default=[0.5, 0.6, 0.7])
     x = sub.add_parser("calibrate-checkpoint", help="Select validation F1 cutoffs for an existing project checkpoint")
     x.add_argument("--checkpoint", required=True)
     x.add_argument("--variant", required=True, choices=FUSION_MODES)
@@ -571,11 +641,16 @@ def parser():
     x.add_argument("--data-seed", type=int, default=42)
     x.add_argument("--batch-size", type=int, default=config.BATCH_SIZE)
     x.add_argument("--workers", type=int, default=config.NUM_WORKERS)
+    x.add_argument("--persistent-workers", action=argparse.BooleanOptionalAction, default=True)
+    x.add_argument("--prefetch-factor", type=int, default=2)
+    x.add_argument("--loader-start-method", choices=("spawn", "fork", "forkserver"), default="spawn")
+    x.add_argument("--loader-timeout", type=int, default=120)
     x.add_argument("--device", default=str(config.DEVICE))
     x.add_argument("--cpu-threads", type=int, default=4)
     x.add_argument("--min-score", type=float, default=0.01)
     x.add_argument("--threshold-min", type=float, default=0.01)
     x.add_argument("--threshold-max", type=float, default=0.95)
+    x.add_argument("--recall-targets", nargs="+", type=float, default=[0.5, 0.6, 0.7])
     x.set_defaults(smoke=False, epochs=0, scheduler="none", max_grad_norm=1.0,
                    objective="vessel-f1", max_train_samples=0, max_val_samples=0)
     return p
@@ -584,14 +659,26 @@ def parser():
 def main():
     p = parser()
     args = p.parse_args()
+    if any(not math.isfinite(r) or not 0 < r <= 1
+           for r in getattr(args, "recall_targets", []) + [getattr(args, "target_recall", 0.6)]):
+        p.error("Recall targets must be finite and in (0, 1]")
+    if not math.isfinite(getattr(args, "coastal_fp_weight", 0.0)) or getattr(args, "coastal_fp_weight", 0.0) < 0:
+        p.error("--coastal-fp-weight must be finite and non-negative")
     if getattr(args, "gamma_init", None) is not None and not math.isfinite(args.gamma_init):
         p.error("--gamma-init must be finite")
     if getattr(args, "diagnostics_every", 0) < 0:
         p.error("--diagnostics-every must be non-negative")
+    if getattr(args, "prefetch_factor", 2) < 1:
+        p.error("--prefetch-factor must be positive")
+    if getattr(args, "loader_timeout", 120) < 0:
+        p.error("--loader-timeout must be non-negative")
     if hasattr(args, "cpu_threads"):
         if args.cpu_threads < 1:
             p.error("--cpu-threads must be positive")
         torch.set_num_threads(args.cpu_threads)
+        print(f"Device: {args.device}; CUDA available: {torch.cuda.is_available()}; "
+              f"PyTorch CPU threads: {args.cpu_threads}; "
+              f"loader workers: {getattr(args, 'workers', 'from saved config')}", flush=True)
     if hasattr(args, "seeds") and (len(set(args.seeds)) != len(args.seeds) or any(s < 0 or s >= 2**32 for s in args.seeds)):
         p.error("Seeds must be distinct integers in [0, 2**32)")
     if args.command == "search":

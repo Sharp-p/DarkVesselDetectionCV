@@ -8,6 +8,7 @@ and learning rate scheduling, and periodic validation logging.
 
 import os
 import math
+import time
 import torch
 import torch.nn as nn
 from globals import (
@@ -29,13 +30,16 @@ from fusion_diagnostics import FusionDiagnostics
 
 """ Runs one training epoch over batches. Returns the mean loss across the epoch."""
 def train_one_epoch(model, optimizer, batches, device=DEVICE, max_grad_norm=1.0,
-                    diagnostics=None, diagnostics_every=10):
+                    diagnostics=None, diagnostics_every=10, timings=None):
     model.train()
     epoch_losses = []
+    started = last_step = time.perf_counter()
+    loader_wait = 0.0
     with FusionDiagnostics(model, diagnostics_every if diagnostics is not None else 0) as tracker:
         for step, (inputs, targets) in enumerate(batches):
+            loader_wait += time.perf_counter() - last_step
             tracker.begin_step(step)
-            inputs, targets = inputs.to(device), targets.to(device)
+            inputs, targets = inputs.to(device, non_blocking=True), targets.to(device, non_blocking=True)
             optimizer.zero_grad()
             pred = model(inputs)
             loss = focal_loss(pred, targets)
@@ -45,12 +49,17 @@ def train_one_epoch(model, optimizer, batches, device=DEVICE, max_grad_norm=1.0,
             tracker.capture_gradients()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
             optimizer.step()
-            epoch_losses.append(loss.item())
+            epoch_losses.append(loss.detach())
+            last_step = time.perf_counter()
         if diagnostics is not None:
             diagnostics.update(tracker.summary())
     if not epoch_losses:
         raise ValueError("Training loader has no batches")
-    return sum(epoch_losses) / len(epoch_losses)
+    mean_loss = sum(torch.stack(epoch_losses).cpu().tolist()) / len(epoch_losses)
+    if timings is not None:
+        timings.update(train_seconds=time.perf_counter()-started, loader_wait_seconds=loader_wait,
+                       batches=len(epoch_losses))
+    return mean_loss
 
 
 """ Runs one validation pass over `batches`, no gradient updates. Returns the mean loss across the epoch. """
@@ -59,7 +68,7 @@ def validate(model, batches, device=DEVICE):
     epoch_losses = []
     with torch.no_grad():
         for inputs, targets in batches:
-            inputs, targets = inputs.to(device), targets.to(device)
+            inputs, targets = inputs.to(device, non_blocking=True), targets.to(device, non_blocking=True)
             pred = model(inputs)
             loss = focal_loss(pred, targets)
             epoch_losses.append(loss.item())

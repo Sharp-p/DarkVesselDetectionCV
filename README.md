@@ -1,5 +1,9 @@
 # Dark Vessel Detection via Multimodal SAR & Context-Guided Cross-Attention (CGCAM)
 
+**Matched recall update:** [MATCHED_RECALL_README.md](MATCHED_RECALL_README.md) covers recall-constrained checkpoint selection and automatic total/coastal false-positive comparisons.
+
+**CPU performance update:** start with [PERFORMANCE_README.md](PERFORMANCE_README.md) for faster validation/metrics, persistent data loading, timing logs, and measured benchmark results. Use a fresh study prefix after updating.
+
 **CGCAM update:** see [CGCAM_README.md](CGCAM_README.md) for gamma 0/0.1 comparisons, local context gating with attenuation/amplification, training diagnostics, and controlled multi-seed experiments.
 
 **Optimizer and threshold tuning:** see [TUNING_README.md](TUNING_README.md) for Linux setup, Optuna Server/dashboard, AdamW/Adam/SGD/RMSprop/Lion studies, validation F1 searches, and frozen test evaluation. The original `run_ablation_study.py` is retained as a legacy fixed-setting workflow; use `tuning.py` for the new experiments.

@@ -20,6 +20,7 @@ Contracts:
 
 import os
 import math
+from functools import lru_cache
 from typing import Tuple, List, Dict, Optional
 import numpy as np
 import pandas as pd
@@ -88,6 +89,15 @@ def normalize_wind_speed(wind: np.ndarray, max_wind: float = MAX_WIND_SPEED_MS) 
 # -----------------------------------------------------------------------------
 # 2. Continuous Gaussian Target Heatmap Generator (CenterNet)
 # -----------------------------------------------------------------------------
+@lru_cache(maxsize=16)
+def _gaussian_kernel(sigma):
+    radius = int(3 * sigma)
+    yy, xx = np.ogrid[-radius:radius+1, -radius:radius+1]
+    kernel = np.exp(-(xx**2 + yy**2)/(2.0*sigma*sigma)).astype(np.float32)
+    kernel.setflags(write=False)
+    return kernel
+
+
 def draw_gaussian_peak(
     heatmap: np.ndarray,
     center_x: int,
@@ -111,14 +121,13 @@ def draw_gaussian_peak(
         return
 
     # vectors containing the coordinates in the grid over the subgrid stands
-    grid_y, grid_x = np.ogrid[y0:y1, x0:x1]
-    # square euclidean distance between each pixel and the center
-    dist_sq = (grid_x - center_x) ** 2 + (grid_y - center_y) ** 2 
-    # calculate bidimensional gaussian distribution
-    gaussian = np.exp(-dist_sq / (2.0 * sigma * sigma)).astype(np.float32)
+    kernel = _gaussian_kernel(float(sigma))
+    gaussian = kernel[y0-center_y+radius:y1-center_y+radius,
+                      x0-center_x+radius:x1-center_x+radius]
 
     # getting the maximum and not summing prevents going over 1 in the probability (centernet paradigm)
-    heatmap[y0:y1, x0:x1] = np.maximum(heatmap[y0:y1, x0:x1], gaussian)
+    view = heatmap[y0:y1, x0:x1]
+    np.maximum(view, gaussian, out=view)
 
 
 # -----------------------------------------------------------------------------
@@ -263,6 +272,8 @@ class DarkVesselDataset(Dataset):
                 # is_vessel: False -> 0 (infrastructure), True or NaN -> 1 (vessel)
                 is_v = np.where(sdf["is_vessel"] == False, 0, 1).astype(np.int32)
                 self.scene_targets[sid] = np.stack([rows, cols, is_v], axis=1)
+                # Binary row-range lookup avoids scanning every scene target per chip.
+                self.scene_targets[sid] = self.scene_targets[sid][np.argsort(rows, kind="stable")]
             else:
                 self.scene_targets[sid] = np.empty((0, 3), dtype=np.int32)
 
@@ -368,6 +379,8 @@ class DarkVesselDataset(Dataset):
 
         targets = self.scene_targets[sid]
         if len(targets) > 0:
+            lo, hi = np.searchsorted(targets[:, 0], [r0, r1])
+            targets = targets[lo:hi]
             mask = (
                 (targets[:, 0] >= r0) & (targets[:, 0] < r1) &
                 (targets[:, 1] >= c0) & (targets[:, 1] < c1)
@@ -383,19 +396,19 @@ class DarkVesselDataset(Dataset):
         if self.is_train:
             # Random Horizontal Flip
             if np.random.rand() > 0.5:
-                x = np.flip(x, axis=2).copy()
-                target = np.flip(target, axis=2).copy()
+                x = np.flip(x, axis=2)
+                target = np.flip(target, axis=2)
             # Random Vertical Flip
             if np.random.rand() > 0.5:
-                x = np.flip(x, axis=1).copy()
-                target = np.flip(target, axis=1).copy()
+                x = np.flip(x, axis=1)
+                target = np.flip(target, axis=1)
             # Random 90-degree Rotations (SAR geometry is nadir-looking top-down)
             rot_k = np.random.choice([0, 1, 2, 3])
             if rot_k > 0:
-                x = np.rot90(x, k=rot_k, axes=(1, 2)).copy()
-                target = np.rot90(target, k=rot_k, axes=(1, 2)).copy()
+                x = np.rot90(x, k=rot_k, axes=(1, 2))
+                target = np.rot90(target, k=rot_k, axes=(1, 2))
 
-        return torch.from_numpy(x).float(), torch.from_numpy(target).float()
+        return torch.from_numpy(np.ascontiguousarray(x)), torch.from_numpy(np.ascontiguousarray(target))
 
 
 # -----------------------------------------------------------------------------

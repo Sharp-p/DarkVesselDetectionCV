@@ -1,4 +1,16 @@
+# Validation of the matched-recall update
+
+- Full test suite: **45 passed, 1 skipped**. The skip is the existing hosted-environment restriction on Unix sockets for loader workers.
+- Two one-epoch synthetic wind/no-wind runs completed with the same RMSprop settings and the recall-constrained objective. Automatic validation reports were generated.
+- Both selected checkpoints were evaluated with frozen validation recall cutoffs; the paired test report was generated successfully.
+- Architecture is unchanged from the CPU-optimized archive; the finer-resolution experiment was removed.
+- No real SAR training or GPU benchmark was performed; accuracy improvements are unverified.
+
 # Validation of the CGCAM update
+
+The results below describe the initial architecture update. The subsequent CPU
+performance update is documented in `PERFORMANCE_README.md` and
+`cpu_benchmark.json`, with additional checks in `tests/test_performance.py`.
 
 - `python -m pytest -q tests`: **23 passed**.
 - Controlled comparison launcher: all eight configurations completed a one-epoch,

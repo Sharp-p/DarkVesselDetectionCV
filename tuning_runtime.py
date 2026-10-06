@@ -14,6 +14,10 @@ from utils import focal_loss
 
 
 def seed_worker(worker_id):
+    # Avoid each loader process creating its own OpenCV thread pool.
+    import cv2
+    cv2.setNumThreads(0)
+    torch.set_num_threads(1)
     seed = torch.initial_seed() % (2**32)
     np.random.seed(seed)
     random.seed(seed)
@@ -55,10 +59,15 @@ def make_loader(cfg, split, seed):
         dataset = Subset(dataset, order.tolist())
     if len(dataset) == 0:
         raise ValueError(f"No {split} samples")
+    worker_options = ({"persistent_workers": cfg.get("persistent_workers", True),
+                       "prefetch_factor": cfg.get("prefetch_factor", 2),
+                       "multiprocessing_context": cfg.get("loader_start_method", "spawn"),
+                       "timeout": cfg.get("loader_timeout", 120)}
+                      if cfg["workers"] > 0 else {})
     return DataLoader(dataset, batch_size=cfg["batch_size"], shuffle=split == "train",
                       num_workers=cfg["workers"], worker_init_fn=seed_worker,
                       generator=torch.Generator().manual_seed(seed),
-                      pin_memory=str(cfg["device"]).startswith("cuda"))
+                      pin_memory=str(cfg["device"]).startswith("cuda"), **worker_options)
 
 
 @torch.no_grad()
@@ -71,27 +80,36 @@ def collect_candidates(model, batches, device, min_score):
     model.eval()
     records, losses = [], []
     for inputs, targets in batches:
-        heatmap, logits = model(inputs.to(device), return_logits=True)
-        loss = focal_loss(heatmap, targets.to(device))
+        heatmap, logits = model(inputs.to(device, non_blocking=True), return_logits=True)
+        loss = focal_loss(heatmap, targets.to(device, non_blocking=True))
         if not torch.isfinite(loss):
             raise FloatingPointError("Non-finite validation/evaluation loss")
-        losses.append(float(loss))
+        losses.append(loss.detach())
         scores = logits.sigmoid()
         maxima = logits.eq(F.max_pool2d(logits, 3, stride=1, padding=1)) & scores.ge(min_score)
-        maxima, scores, targets = maxima.cpu(), scores.cpu(), targets.cpu()
+        # Gather on the inference device; copy sparse coordinates/scores once.
+        # Tensor-to-Python conversion inside the old per-peak loop dominated CPU.
+        coordinates = maxima.nonzero(as_tuple=True)
+        values = scores[coordinates].float().cpu().numpy()
+        locations = torch.stack(coordinates, dim=1).cpu().numpy()
+        truth = np.column_stack(np.nonzero(targets.cpu().numpy() == 1.0))
+        shores = inputs[:, 3].cpu().numpy()
         for b in range(len(inputs)):
             record = {"pred": [], "gt": []}
             for c in range(2):
-                coords = torch.nonzero(maxima[b, c], as_tuple=False)
-                preds = [(int(r), int(k), float(scores[b, c, r, k]),
-                          bool(inputs[b, 3, r, k] <= 0.1)) for r, k in coords]
-                gt = [(int(r), int(k)) for r, k in torch.nonzero(targets[b, c].eq(1), as_tuple=False)]
+                mask = (locations[:, 0] == b) & (locations[:, 1] == c)
+                coords = locations[mask, 2:]
+                rows, cols = coords[:, 0], coords[:, 1]
+                preds = list(zip(rows.tolist(), cols.tolist(), values[mask].tolist(),
+                                 (shores[b, rows, cols] <= 0.1).tolist()))
+                gt_coords = truth[(truth[:, 0] == b) & (truth[:, 1] == c), 2:]
+                gt = list(zip(gt_coords[:, 0].tolist(), gt_coords[:, 1].tolist()))
                 record["pred"].append(preds)
                 record["gt"].append(gt)
             records.append(record)
     if not losses:
         raise ValueError("No evaluation batches")
-    return records, sum(losses)/len(losses)
+    return records, sum(torch.stack(losses).cpu().tolist())/len(losses)
 
 
 def file_sha256(path):

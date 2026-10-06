@@ -37,7 +37,7 @@ from globals import PATCH_SIZE, NUM_CLASSES, INPUT_CHANNELS, FUSION_MODE
 # Contract is defined once in globals.py (5 channels: VH, VV, bathymetry,
 # distance_to_shore, wind_speed). data.py must supply all five normalized channels.
 FUSION_MODES = ("sar_only", "early_fusion", "cgcam_no_wind", "cgcam")
-CGCAM_MODES = ("global", "local_gate")
+CGCAM_MODES = ("global", "local_gate", "local_multiscale")
 
 
 # -----------------------------------------------------------------------------
@@ -267,6 +267,12 @@ class DarkVesselNet(nn.Module):
                 fusion_class = CGCAMModule if cgcam_mode == "global" else LocalContextGate
                 self.cgcam = fusion_class(radar_channels=128, context_channels=64,
                                           latent_dim=64, gamma_init=gamma_init)
+                if cgcam_mode == "local_multiscale":
+                    # Also condition radar before the final downsampling. Keep
+                    # the original context encoder and common initialization.
+                    self.context_gate_fine = LocalContextGate(
+                        radar_channels=128, context_channels=64, latent_dim=64,
+                        gamma_init=gamma_init)
 
         # --- D. Decoder & Upsampling Neck (32x32 -> 256x256) ---
         self.decoder_up0 = nn.Sequential(
@@ -320,7 +326,6 @@ class DarkVesselNet(nn.Module):
         f_r = self.radar_stage1(f_r)
         f_r = self.radar_down(f_r)
         f_r = self.radar_stage2(f_r)
-        f_r = self.radar_bottleneck(f_r)
 
         # 2/3. Extract context and cross-attend only in the proposed model.
         if self.use_cgcam:
@@ -329,10 +334,17 @@ class DarkVesselNet(nn.Module):
                 # Preserve the three-channel encoder and the caller's input.
                 # Zeroing only wind also removes its gradient from this variant.
                 x_context = torch.cat((x[:, 2:4], torch.zeros_like(x[:, 4:5])), dim=1)
-            f_c = self.context_stem(x_context)
+            if self.cgcam_mode == "local_multiscale":
+                # 64x64 context/radar alignment for a 256x256 input, then 32x32.
+                f_c = self.context_stem[1](self.context_stem[0](x_context))
+                f_r = self.context_gate_fine(f_r, f_c)
+                f_c = self.context_stem[3](self.context_stem[2](f_c))
+            else:
+                f_c = self.context_stem(x_context)
+            f_r = self.radar_bottleneck(f_r)
             f_out = self.cgcam(f_r, f_c)
         else:
-            f_out = f_r
+            f_out = self.radar_bottleneck(f_r)
 
         # 4. Decoder upsampling back to (256, 256)
         d0 = self.decoder_up0(f_out)  # (B, 128, 64, 64)

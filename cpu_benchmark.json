@@ -1,0 +1,24 @@
+{
+  "scope": "synthetic_CPU_microbenchmark_not_end_to_end_training",
+  "patches": 4,
+  "shape": [
+    2,
+    256,
+    256
+  ],
+  "threads": 2,
+  "candidates": 58753,
+  "median_seconds": {
+    "candidate_extraction": 0.15203865199998745,
+    "exact_metrics": 0.07019485199998599
+  },
+  "equivalent": true,
+  "baseline_median_seconds": {
+    "candidate_extraction": 1.227265217000081,
+    "exact_metrics": 0.17420186099991497
+  },
+  "speedup": {
+    "candidate_extraction": 8.072060629688972,
+    "exact_metrics": 2.4816899820509595
+  }
+}

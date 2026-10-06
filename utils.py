@@ -36,7 +36,9 @@ def focal_loss(pred, target, alpha=FOCAL_ALPHA, beta=FOCAL_BETA, eps=1e-4):
 
     # normalize by number of ground-truth peaks; fall back to neg_loss alone
     # for background patches (no positives)
-    return neg_loss if num_pos == 0 else (pos_loss + neg_loss) / num_pos
+    # Keep the original all-background fallback without a CUDA-to-host scalar
+    # branch on every batch. Clamp also keeps the unselected division finite.
+    return torch.where(num_pos > 0, (pos_loss + neg_loss) / num_pos.clamp_min(1), neg_loss)
 
 
 """turns a predicted heatmap into a list of detections."""

@@ -1,5 +1,7 @@
 # CGCAM experiments: gamma initialization and local context gating
 
+**Matched recall update:** [MATCHED_RECALL_README.md](MATCHED_RECALL_README.md) covers recall-constrained checkpoint selection and automatic total/coastal false-positive comparisons.
+
 This update makes the architectural hypotheses testable. It does not assume that
 zero-initialized gamma is a bug, or that changing fusion will improve accuracy.
 The original global attention remains the default. The comparison launcher
@@ -118,6 +120,29 @@ SQLite is used directly by default. To use the existing server/dashboard,
 start it with the database you want to inspect and append `--grpc-host 127.0.0.1`
 to the comparison command. The server's database is authoritative in gRPC mode;
 the launcher's local `--storage` is not used by the proxy client.
+
+## Wind versus no wind with the same optimizer
+
+Use `--wind-only` to exclude SAR-only and early-fusion controls. For the local
+fusion pair, run:
+
+```bash
+python compare_cgcam.py --wind-only --groups local \
+  --data-dir /absolute/path/to/dataset --output wind_pair_rmsprop \
+  --optimizer rmsprop --lr 0.0002649149454284989 --weight-decay 0 \
+  --seeds 42 43 44 --epochs 30 --device cuda --workers 4
+```
+
+This runs two variants across three seeds: six training runs, 180 total epochs.
+Both variants use identical optimizer settings (including fixed betas/momentum),
+learning rate, weight decay, scheduler, seeds, data split, batch size and epoch
+budget. Only wind availability differs within this pair. Validation still chooses
+the checkpoint and detection threshold separately for each run. Add `--dry-run`
+to inspect the commands. Use `--groups control` for original attention or
+`--groups gamma` for attention with gamma initialized to 0.1. Choose a fresh
+output directory when changing settings. To compare another optimizer, change
+`--optimizer`, `--lr`, and `--weight-decay` together for the whole pair; this
+launcher does not tune the two variants independently.
 
 ## Inspect results and diagnostics
 
