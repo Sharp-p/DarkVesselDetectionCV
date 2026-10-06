@@ -1,44 +1,12 @@
 # DarkVesselNet tuning on a local Linux machine
 
+**CGCAM architecture experiments:** [CGCAM_README.md](CGCAM_README.md) documents the new `--cgcam-mode`, `--gamma-init`, diagnostics, and `compare_cgcam.py` launcher. Original global attention remains the default. Use fresh study prefixes after this code update.
+
 This guide runs **Optuna studies for AdamW, Adam, SGD + Nesterov momentum, RMSprop and Lion**, searches detection thresholds using validation F1, and evaluates the selected models on test scenes only after the choices are frozen.
 
 You do not need previous Optuna experience. Start with the synthetic smoke test, then calibrate existing checkpoints or run a small real-data study. The original training/evaluation entry points remain available; `tuning.py` is the new tuning workflow.
 
 ## 1. What the components do
-
-### Performance update
-
-Fast cuDNN is now the default: benchmarking is enabled and deterministic
-algorithm selection is disabled. Seeds are still set. Use `--deterministic`
-with `search` or `calibrate-checkpoint` to opt into the slower cuDNN settings;
-`repeat` and `evaluate` inherit the saved configuration. The optional
-`--fast-cudnn` flag explicitly selects the default.
-
-Candidate extraction now finds maxima and gathers scores/coastal flags on the
-model device, transferring only sparse results to the CPU. Optuna keeps
-NumPy arrays in memory and creates Python tuples only when saving candidate
-caches. Greedy matching uses bounded NumPy distance matrices; threshold curves
-use cumulative arrays instead of a dictionary for every score. Frozen test
-metrics reuse the same curves. JSON cache schemas and detection/matching rules
-remain compatible.
-
-Loaders retain workers across epochs when `--workers` is positive. Transfers to
-the device use `non_blocking=True`; CUDA loaders already pin memory. The focal
-loss no longer branches on a GPU scalar. Worker RNG streams now continue across
-epochs, so augmentation sequences can differ from the older worker lifecycle.
-
-Each epoch logs training, validation and metric seconds, plus candidate counts;
-`history.json` also records validation patch counts. Validation timing includes
-data loading, inference, loss and candidate extraction. Training timing includes
-data loading and optimization. Checkpoint/JSON writes are outside these timings.
-Full validation, the 0.01 score floor, exact F1 selection, AP and coastal metrics
-are retained. Early models can still produce many candidates, and validation
-still requires a full inference pass. GPU throughput must be measured on your
-machine; this update was checked with the existing 15 CPU tests.
-
-**Start with a new `--study-prefix`**: the code/config hash changed, so existing
-studies intentionally reject mixing the old and new implementations. Existing
-candidate JSON caches can still be recalibrated without inference.
 
 | Component | Purpose |
 | --- | --- |
@@ -84,7 +52,7 @@ python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
 python -m pip install -r requirements-tuning.txt
 python -m pip check
 python -c "import torch, optuna; print('torch:', torch.__version__, 'optuna:', optuna.__version__, 'CUDA:', torch.cuda.is_available())"
-python -m pytest -q tests/test_tuning.py
+python -m pytest -q tests
 ```
 
 The requirements include NumPy, pandas, SciPy, tifffile, headless OpenCV, matplotlib, Optuna **4.5.0**, Optuna Dashboard **0.19.0**, grpcio, protobuf, and pytest. Lion is implemented locally in `optimizers.py` following the published algorithm; no extra Lion package is required. Optuna is pinned because its gRPC API is experimental. Use the same environment for server and workers.

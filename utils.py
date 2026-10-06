@@ -36,9 +36,7 @@ def focal_loss(pred, target, alpha=FOCAL_ALPHA, beta=FOCAL_BETA, eps=1e-4):
 
     # normalize by number of ground-truth peaks; fall back to neg_loss alone
     # for background patches (no positives)
-    # A Python branch on a CUDA scalar forces a host/device synchronization.
-    # Clamp the unselected denominator too, so background-only gradients stay finite.
-    return torch.where(num_pos > 0, (pos_loss + neg_loss) / num_pos.clamp_min(1), neg_loss)
+    return neg_loss if num_pos == 0 else (pos_loss + neg_loss) / num_pos
 
 
 """turns a predicted heatmap into a list of detections."""
@@ -130,6 +128,7 @@ def save_checkpoint(model, optimizer, epoch, val_loss, checkpoint_dir=CHECKPOINT
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "val_loss": val_loss,
+        "model_config": model.model_config() if hasattr(model, "model_config") else None,
     }, path)
     return path
 

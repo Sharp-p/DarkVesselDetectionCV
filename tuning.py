@@ -23,13 +23,13 @@ import optuna
 import torch
 
 import globals as config
-from network import DarkVesselNet, FUSION_MODES
+from network import DarkVesselNet, FUSION_MODES, CGCAM_MODES
 from optimizers import DEFAULTS, OPTIMIZERS, SEARCH_SPACES, make_optimizer
 from optuna_server import client_storage
 from train import train_one_epoch
-from tuning_metrics import DetectionCurve, summarize
+from tuning_metrics import DetectionCurve, at_frozen_thresholds, summarize
 from tuning_runtime import (code_digest, collect_candidates, dataset_fingerprint,
-                            file_sha256, iter_candidate_records, make_loader)
+                            file_sha256, make_loader)
 
 SCHEMA = 1
 
@@ -46,15 +46,8 @@ def save_cache(path, records, cfg, split):
     path = Path(path)
     tmp = path.with_name(path.name + f".{os.getpid()}.tmp")
     with gzip.open(tmp, "wt") as f:
-        header = {"schema": SCHEMA, "split": split, "candidate_floor": cfg["min_score"],
-                  "smoke": cfg["smoke"]}
-        f.write(json.dumps(header, allow_nan=False)[:-1] + ', "records": [')
-        # Convert one patch at a time, only when saving a selected epoch/test cache.
-        for index, record in enumerate(iter_candidate_records(records)):
-            if index:
-                f.write(", ")
-            json.dump(record, f, allow_nan=False)
-        f.write("]}")
+        json.dump({"schema": SCHEMA, "split": split, "candidate_floor": cfg["min_score"],
+                   "smoke": cfg["smoke"], "records": records}, f, allow_nan=False)
     tmp.replace(path)
 
 
@@ -102,12 +95,18 @@ def summarize_cfg(records, cfg):
                      distance_threshold=cfg["match_distance"])
 
 
+def build_model(cfg):
+    return DarkVesselNet(fusion_mode=cfg["variant"],
+                         cgcam_mode=cfg.get("cgcam_mode", "global"),
+                         gamma_init=cfg.get("gamma_init", 0.0)).to(cfg["device"])
+
+
 def fit_one(cfg, optimizer_name, params, seed, directory, report=None):
     """Train and choose epoch + per-class cutoffs entirely on validation data."""
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
-    config.set_seed(seed, deterministic=cfg.get("deterministic", False))
-    model = DarkVesselNet(fusion_mode=cfg["variant"]).to(cfg["device"])
+    config.set_seed(seed)
+    model = build_model(cfg)
     optimizer = make_optimizer(model, optimizer_name, **params)
     scheduler = (torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg["epochs"])
                  if cfg["scheduler"] == "cosine" else None)
@@ -120,31 +119,19 @@ def fit_one(cfg, optimizer_name, params, seed, directory, report=None):
     start = time.monotonic()
     for epoch in range(1, cfg["epochs"] + 1):
         lr = optimizer.param_groups[0]["lr"]
-        epoch_start = time.monotonic()
+        diagnostics = {}
         train_loss = train_one_epoch(model, optimizer, train_loader, device=cfg["device"],
-                                     max_grad_norm=cfg["max_grad_norm"])
-        # Include queued training kernels in the training timing on accelerators.
-        if str(cfg["device"]).startswith("cuda"):
-            torch.cuda.synchronize(cfg["device"])
-        elif str(cfg["device"]).startswith("mps"):
-            torch.mps.synchronize()
-        train_seconds = time.monotonic() - epoch_start
-        validation_start = time.monotonic()
-        records, val_loss = collect_candidates(model, val_loader, cfg["device"], cfg["min_score"], compact=True)
-        validation_seconds = time.monotonic() - validation_start
-        metrics_start = time.monotonic()
+                                     max_grad_norm=cfg["max_grad_norm"], diagnostics=diagnostics,
+                                     diagnostics_every=cfg.get("diagnostics_every", 10))
+        records, val_loss = collect_candidates(model, val_loader, cfg["device"], cfg["min_score"])
         summary = summarize_cfg(records, cfg)
         score = objective_score(summary, cfg["objective"])
-        metrics_seconds = time.monotonic() - metrics_start
-        candidate_count = sum(len(p) for record in records for p in record["pred"])
         history.append({"epoch": epoch, "lr": lr, "train_loss": train_loss,
                         "val_loss": val_loss, "objective": score,
-                        "train_seconds": train_seconds, "validation_seconds": validation_seconds,
-                        "metrics_seconds": metrics_seconds, "candidate_count": candidate_count,
-                        "validation_patches": len(records),
                         "best_f1": [m["f1"] for m in summary["best_by_channel"]],
                         "thresholds": [m["threshold"] for m in summary["best_by_channel"]],
-                        "ap_at_floor": summary["ap_at_floor"]})
+                        "ap_at_floor": summary["ap_at_floor"],
+                        "fusion_diagnostics": diagnostics})
         if scheduler is not None:
             scheduler.step()
         if score > best_score:
@@ -156,6 +143,7 @@ def fit_one(cfg, optimizer_name, params, seed, directory, report=None):
                 "scheduler_state_dict": scheduler.state_dict() if scheduler else None,
                 "epoch": epoch, "val_loss": val_loss, "validation_objective": score,
                 "config": cfg, "optimizer_name": optimizer_name, "params": params,
+                "model_config": model.model_config(),
                 "seed": seed, "thresholds": [m["threshold"] for m in summary["best_by_channel"]],
             }
             tmp = directory / "best.pt.tmp"
@@ -163,11 +151,12 @@ def fit_one(cfg, optimizer_name, params, seed, directory, report=None):
             tmp.replace(directory / "best.pt")
             write_json(directory / "best_validation.json", summary)
         write_json(directory / "history.json", history)
+        diagnostic_text = (f" gamma={diagnostics['gamma_end']:.5f} "
+                           f"branch/radar={diagnostics['relative_branch_norm_mean']:.4g}"
+                           if diagnostics.get("enabled") else "")
         print(f"{cfg['variant']}/{optimizer_name} seed={seed} epoch={epoch}/{cfg['epochs']} "
               f"train={train_loss:.5f} val={val_loss:.5f} {cfg['objective']}={score:.5f} "
-              f"best={best_score:.5f} | train={train_seconds:.1f}s "
-              f"validation={validation_seconds:.1f}s metrics={metrics_seconds:.2f}s "
-              f"candidates={candidate_count}", flush=True)
+              f"best={best_score:.5f}{diagnostic_text}", flush=True)
         if report is not None:
             report(epoch, best_score)
     save_cache(directory / "validation_candidates.json.gz", best_records, cfg, "val")
@@ -213,8 +202,10 @@ def build_cfg(args):
            "scenes": {"train": config.TRAIN_SCENES, "val": config.VAL_SCENES, "test": config.TEST_SCENES},
            "data_seed": args.data_seed, "epochs": args.epochs, "batch_size": args.batch_size,
            "workers": args.workers, "device": args.device, "smoke": args.smoke,
-           "deterministic": getattr(args, "deterministic", False),
            "scheduler": args.scheduler, "max_grad_norm": args.max_grad_norm,
+           "cgcam_mode": getattr(args, "cgcam_mode", None) or "global",
+           "gamma_init": args.gamma_init if getattr(args, "gamma_init", None) is not None else 0.0,
+           "diagnostics_every": getattr(args, "diagnostics_every", 10),
            "objective": args.objective, "min_score": args.min_score,
            "threshold_min": args.threshold_min, "threshold_max": args.threshold_max,
            "match_distance": config.MATCH_DISTANCE_PIXELS,
@@ -375,19 +366,29 @@ def run_calibrate(args):
 
 def run_calibrate_checkpoint(args):
     """Calibrate an existing legacy checkpoint without retraining or loading test data."""
+    checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
+    if "model_state_dict" not in checkpoint:
+        raise ValueError("Expected a project checkpoint with model_state_dict")
+    saved = checkpoint.get("model_config") or {}
+    prior_cfg = checkpoint.get("config", {})
+    saved_variant = saved.get("fusion_mode", prior_cfg.get("variant"))
+    if saved_variant is not None and saved_variant != args.variant:
+        raise ValueError("--variant differs from the saved checkpoint's variant")
+    saved_mode = saved.get("cgcam_mode", prior_cfg.get("cgcam_mode"))
+    if args.cgcam_mode is not None and saved_mode is not None and args.cgcam_mode != saved_mode:
+        raise ValueError("--cgcam-mode differs from the saved checkpoint's architecture")
+    args.cgcam_mode = args.cgcam_mode or saved_mode or "global"
+    if args.gamma_init is None:
+        args.gamma_init = saved.get("gamma_init", prior_cfg.get("gamma_init", 0.0))
     cfg = dict(build_cfg(args), variant=args.variant)
-    config.set_seed(args.seed, deterministic=cfg["deterministic"])
     out = Path(args.output).resolve()
     if out.exists() and any(out.iterdir()):
         raise ValueError("Calibration output must be new/empty")
     out.mkdir(parents=True, exist_ok=True)
-    checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
-    if "model_state_dict" not in checkpoint:
-        raise ValueError("Expected a project checkpoint with model_state_dict")
-    model = DarkVesselNet(fusion_mode=args.variant).to(cfg["device"])
+    model = build_model(cfg)
     model.load_state_dict(checkpoint["model_state_dict"])
     records, loss = collect_candidates(model, make_loader(cfg, "val", cfg["data_seed"]),
-                                       cfg["device"], cfg["min_score"], compact=True)
+                                       cfg["device"], cfg["min_score"])
     summary = summarize_cfg(records, cfg)
     thresholds = [m["threshold"] for m in summary["best_by_channel"]]
     shutil.copyfile(args.checkpoint, out/"best.pt")
@@ -429,19 +430,19 @@ def run_evaluate(args):
         if file_sha256(checkpoint_path) != selection["checkpoint_sha256"]:
             raise ValueError("Selected checkpoint changed after validation")
         cfg["device"] = args.device
-        config.set_seed(selection["seed"], deterministic=cfg.get("deterministic", False))
         checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
-        model = DarkVesselNet(fusion_mode=cfg["variant"]).to(cfg["device"])
+        model = build_model(cfg)
         model.load_state_dict(checkpoint["model_state_dict"])
         test_fingerprint = dataset_fingerprint(cfg, ("test",))
         test_loader = make_loader(cfg, "test", cfg["data_seed"])
-        records, loss = collect_candidates(model, test_loader, cfg["device"], cfg["min_score"], compact=True)
+        records, loss = collect_candidates(model, test_loader, cfg["device"], cfg["min_score"])
+        frozen = at_frozen_thresholds(records, selection["thresholds"], cfg["match_distance"])
+        fixed = at_frozen_thresholds(records, [0.3, 0.3], cfg["match_distance"])
         curves = [DetectionCurve(records, c, cfg["match_distance"]) for c in range(2)]
-        frozen = [curve.at(selection["thresholds"][c]) for c, curve in enumerate(curves)]
-        fixed = [curve.at(0.3) for curve in curves]
         sweep_thresholds = sorted(set([cfg["min_score"], 0.3, *selection["thresholds"],
                                       *[i/100 for i in range(1, 100) if i/100 >= cfg["min_score"]]]))
         result = {"seed": run["seed"], "variant": cfg["variant"], "optimizer": selection["optimizer_name"],
+                  "model_config": model.model_config(),
                   "epoch": selection["epoch"], "smoke": cfg["smoke"], "test_loss": loss,
                   "scope": "sampled_patch_instances_not_scene_level", "num_patches": len(records),
                   "threshold_source": "validation", "thresholds": selection["thresholds"],
@@ -505,6 +506,12 @@ def parser():
     s = sub.add_parser("search", help="Train Optuna trials using train/validation data only")
     s.add_argument("--variants", nargs="+", choices=FUSION_MODES, default=list(FUSION_MODES))
     s.add_argument("--optimizers", nargs="+", choices=OPTIMIZERS, default=list(OPTIMIZERS))
+    s.add_argument("--cgcam-mode", choices=CGCAM_MODES, default="global",
+                   help="CGCAM fusion mechanism; ignored by SAR-only and early fusion")
+    s.add_argument("--gamma-init", type=float, default=0.0,
+                   help="Learnable residual scale initialization; compare 0 and 0.1")
+    s.add_argument("--diagnostics-every", type=int, default=10,
+                   help="Sample fusion activity/gradients every N train batches; 0 disables")
     s.add_argument("--study-prefix", default="darkvessel-v1")
     s.add_argument("--trials", type=int, default=10, help="Total finished trial budget PER variant/optimizer study")
     s.add_argument("--epochs", type=int, default=config.NUM_EPOCHS)
@@ -514,11 +521,6 @@ def parser():
     s.add_argument("--batch-size", type=int, default=config.BATCH_SIZE)
     s.add_argument("--workers", type=int, default=config.NUM_WORKERS)
     s.add_argument("--device", default=str(config.DEVICE))
-    cudnn = s.add_mutually_exclusive_group()
-    cudnn.add_argument("--fast-cudnn", dest="deterministic", action="store_false", default=False,
-                       help="Enable cuDNN benchmarking and allow nondeterministic kernels (default)")
-    cudnn.add_argument("--deterministic", action="store_true",
-                       help="Opt into deterministic cuDNN algorithms and disable benchmarking")
     s.add_argument("--cpu-threads", type=int, default=4)
     s.add_argument("--data-dir", default=config.DATA_DIR)
     s.add_argument("--labels")
@@ -558,6 +560,10 @@ def parser():
     x = sub.add_parser("calibrate-checkpoint", help="Select validation F1 cutoffs for an existing project checkpoint")
     x.add_argument("--checkpoint", required=True)
     x.add_argument("--variant", required=True, choices=FUSION_MODES)
+    x.add_argument("--cgcam-mode", choices=CGCAM_MODES, default=None,
+                   help="Normally inferred from checkpoint metadata; legacy default is global")
+    x.add_argument("--gamma-init", type=float, default=None,
+                   help="Initialization metadata only; saved learned gamma is restored")
     x.add_argument("--output", required=True)
     x.add_argument("--seed", type=int, default=42, help="Metadata: seed used to train the existing checkpoint")
     x.add_argument("--data-dir", default=config.DATA_DIR)
@@ -566,11 +572,6 @@ def parser():
     x.add_argument("--batch-size", type=int, default=config.BATCH_SIZE)
     x.add_argument("--workers", type=int, default=config.NUM_WORKERS)
     x.add_argument("--device", default=str(config.DEVICE))
-    cudnn = x.add_mutually_exclusive_group()
-    cudnn.add_argument("--fast-cudnn", dest="deterministic", action="store_false", default=False,
-                       help="Enable cuDNN benchmarking and allow nondeterministic kernels (default)")
-    cudnn.add_argument("--deterministic", action="store_true",
-                       help="Opt into deterministic cuDNN algorithms and disable benchmarking")
     x.add_argument("--cpu-threads", type=int, default=4)
     x.add_argument("--min-score", type=float, default=0.01)
     x.add_argument("--threshold-min", type=float, default=0.01)
@@ -583,6 +584,10 @@ def parser():
 def main():
     p = parser()
     args = p.parse_args()
+    if getattr(args, "gamma_init", None) is not None and not math.isfinite(args.gamma_init):
+        p.error("--gamma-init must be finite")
+    if getattr(args, "diagnostics_every", 0) < 0:
+        p.error("--diagnostics-every must be non-negative")
     if hasattr(args, "cpu_threads"):
         if args.cpu_threads < 1:
             p.error("--cpu-threads must be positive")

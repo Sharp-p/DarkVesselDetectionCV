@@ -37,6 +37,7 @@ from globals import PATCH_SIZE, NUM_CLASSES, INPUT_CHANNELS, FUSION_MODE
 # Contract is defined once in globals.py (5 channels: VH, VV, bathymetry,
 # distance_to_shore, wind_speed). data.py must supply all five normalized channels.
 FUSION_MODES = ("sar_only", "early_fusion", "cgcam_no_wind", "cgcam")
+CGCAM_MODES = ("global", "local_gate")
 
 
 # -----------------------------------------------------------------------------
@@ -89,7 +90,8 @@ class CGCAMModule(nn.Module):
     Implements FORMULARY.md sections 4.1-4.3 exactly. Suppression of coastal and
     wind-driven false alarms is a learned behavior to evaluate, not a fixed mask.
     """
-    def __init__(self, radar_channels: int = 128, context_channels: int = 64, latent_dim: int = 64):
+    def __init__(self, radar_channels: int = 128, context_channels: int = 64,
+                 latent_dim: int = 64, gamma_init: float = 0.0):
         super().__init__()
         if min(radar_channels, context_channels, latent_dim) <= 0:
             raise ValueError("CGCAM channel counts and latent_dim must be positive.")
@@ -105,7 +107,9 @@ class CGCAMModule(nn.Module):
         self.out_proj = nn.Conv2d(latent_dim, radar_channels, kernel_size=1, bias=False)
 
         # Learnable residual gating scalar, initialized to 0.0 for stable warm-start
-        self.gamma = nn.Parameter(torch.zeros(1))
+        if not math.isfinite(gamma_init):
+            raise ValueError("gamma_init must be finite")
+        self.gamma = nn.Parameter(torch.full((1,), float(gamma_init)))
 
     def forward(self, f_r: torch.Tensor, f_c: torch.Tensor) -> torch.Tensor:
         """
@@ -137,6 +141,43 @@ class CGCAMModule(nn.Module):
         # 4. Gated residual connection
         f_out = f_r + self.gamma * self.out_proj(f_att)
         return f_out
+
+
+class LocalContextGate(nn.Module):
+    """Aligned spatial/channel modulation, with signed residual corrections.
+
+    Context and radar features interact at the same grid location. A depthwise
+    3x3 convolution adds a local neighborhood; no N-by-N attention is formed.
+    With gamma=0.1 the initial multiplier lies in (0.9, 1.1), permitting both
+    attenuation and amplification. Gamma remains an unconstrained learned scalar.
+    This is an alternative fusion architecture, not global cross-attention.
+    """
+    def __init__(self, radar_channels=128, context_channels=64, latent_dim=64,
+                 gamma_init=0.1):
+        super().__init__()
+        if min(radar_channels, context_channels, latent_dim) <= 0:
+            raise ValueError("Channel counts must be positive")
+        if not math.isfinite(gamma_init):
+            raise ValueError("gamma_init must be finite")
+        self.context_proj = nn.Conv2d(context_channels, latent_dim, 1, bias=False)
+        self.radar_proj = nn.Conv2d(radar_channels, latent_dim, 1, bias=False)
+        self.gate_conv = nn.Sequential(
+            nn.Conv2d(latent_dim, latent_dim, 3, padding=1,
+                      groups=latent_dim, bias=False),
+            nn.BatchNorm2d(latent_dim),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(latent_dim, radar_channels, 1),
+        )
+        self.gamma = nn.Parameter(torch.full((1,), float(gamma_init)))
+
+    def forward(self, f_r, f_c):
+        if f_r.ndim != 4 or f_c.ndim != 4:
+            raise ValueError("LocalContextGate expects two (B, C, H, W) feature maps")
+        if f_r.shape[0] != f_c.shape[0] or f_r.shape[2:] != f_c.shape[2:]:
+            raise ValueError("Radar and context features must have matching batch and spatial dimensions")
+        interaction = self.context_proj(f_c) * self.radar_proj(f_r)
+        signed_gate = 2.0 * torch.sigmoid(self.gate_conv(interaction)) - 1.0
+        return f_r + self.gamma * f_r * signed_gate
 
 
 # -----------------------------------------------------------------------------
@@ -171,12 +212,20 @@ class DarkVesselNet(nn.Module):
         self,
         fusion_mode: str = FUSION_MODE,
         num_classes: int = NUM_CLASSES,
+        cgcam_mode: str = "global",
+        gamma_init: float = 0.0,
     ):
         super().__init__()
         if fusion_mode not in FUSION_MODES:
             raise ValueError(f"fusion_mode must be one of {FUSION_MODES}; got {fusion_mode!r}.")
         if num_classes != 2:
             raise ValueError("The project contract requires two classes: vessel and structure.")
+        if cgcam_mode not in CGCAM_MODES:
+            raise ValueError(f"cgcam_mode must be one of {CGCAM_MODES}")
+        if not math.isfinite(gamma_init):
+            raise ValueError("gamma_init must be finite")
+        self.cgcam_mode = cgcam_mode
+        self.gamma_init = float(gamma_init)
         self.fusion_mode = fusion_mode
         self.use_cgcam = fusion_mode in ("cgcam_no_wind", "cgcam")
         self.early_fusion = fusion_mode == "early_fusion"
@@ -205,13 +254,19 @@ class DarkVesselNet(nn.Module):
         # --- B/C. Context Encoder and CGCAM (Proposed Model Only) ---
         # Baselines contain no unused context parameters or BatchNorm updates.
         if self.use_cgcam:
-            self.context_stem = nn.Sequential(
-                ConvBlock(3, 32, stride=2),   # Bathymetry, shore, wind; 256 -> 128
-                ConvBlock(32, 64, stride=2),  # 128 -> 64
-                ConvBlock(64, 64, stride=2),  # 64 -> 32
-                ResidualBlock(64),
-            )
-            self.cgcam = CGCAMModule(radar_channels=128, context_channels=64, latent_dim=64)
+            # A separate CPU initialization stream keeps shared radar/decoder
+            # weights identical across SAR-only and both CGCAM modes per seed.
+            with torch.random.fork_rng(devices=[]):
+                torch.random.default_generator.manual_seed(torch.initial_seed() ^ 0x434743414D)
+                self.context_stem = nn.Sequential(
+                    ConvBlock(3, 32, stride=2),
+                    ConvBlock(32, 64, stride=2),
+                    ConvBlock(64, 64, stride=2),
+                    ResidualBlock(64),
+                )
+                fusion_class = CGCAMModule if cgcam_mode == "global" else LocalContextGate
+                self.cgcam = fusion_class(radar_channels=128, context_channels=64,
+                                          latent_dim=64, gamma_init=gamma_init)
 
         # --- D. Decoder & Upsampling Neck (32x32 -> 256x256) ---
         self.decoder_up0 = nn.Sequential(
@@ -235,6 +290,11 @@ class DarkVesselNet(nn.Module):
 
         # Bias initialization for focal loss stability: init bias to -2.19 (prob ~ 0.1)
         nn.init.constant_(self.heatmap_head[-1].bias, -2.19)
+
+    def model_config(self):
+        """Constructor settings; actual learned gamma is saved in state_dict."""
+        return {"fusion_mode": self.fusion_mode, "num_classes": self.num_classes,
+                "cgcam_mode": self.cgcam_mode, "gamma_init": self.gamma_init}
 
     def forward(self, x: torch.Tensor, return_logits: bool = False):
         """
