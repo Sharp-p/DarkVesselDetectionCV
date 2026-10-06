@@ -38,9 +38,7 @@ from globals import (
 )
 
 
-# -----------------------------------------------------------------------------
-# 1. Radiometric and Geospatial Normalization Utilities
-# -----------------------------------------------------------------------------
+# Radiometric and Geospatial Normalization Utilities
 def normalize_sar_db(arr: np.ndarray, min_db: float, max_db: float) -> np.ndarray:
     """
     Standardizes raw SAR backscatter values (decibels) into [0.0, 1.0].
@@ -85,9 +83,7 @@ def normalize_wind_speed(wind: np.ndarray, max_wind: float = MAX_WIND_SPEED_MS) 
 
 
 
-# -----------------------------------------------------------------------------
-# 2. Continuous Gaussian Target Heatmap Generator (CenterNet)
-# -----------------------------------------------------------------------------
+# Continuous Gaussian Target Heatmap Generator (CenterNet)
 def draw_gaussian_peak(
     heatmap: np.ndarray,
     center_x: int,
@@ -121,9 +117,7 @@ def draw_gaussian_peak(
     heatmap[y0:y1, x0:x1] = np.maximum(heatmap[y0:y1, x0:x1], gaussian)
 
 
-# -----------------------------------------------------------------------------
-# 3. Geospatial Scene Context Cache (Bathymetry & Shore Distance via EDT)
-# -----------------------------------------------------------------------------
+# Geospatial Scene Context Cache (Bathymetry & Shore Distance via EDT)
 class SceneContextCache:
     """
     Caches low-resolution environmental rasters (bathymetry, owiMask, owiWindSpeed, ~441x596, ~500 KB)
@@ -231,11 +225,11 @@ class DarkVesselDataset(Dataset):
         self.data_dir = data_dir
         self.is_train = is_train
 
-        # Load annotations filtered by selected scene IDs
+        # load annotations filtered by selected scene IDs
         labels_df = pd.read_csv(labels_path)
         self.df = labels_df[labels_df["scene_id"].isin(scene_ids)].copy()
 
-        # Cache file paths, shapes, and context per scene
+        # cache file paths, shapes, and context per scene
         self.sar_paths: Dict[str, Dict[str, str]] = {}
         self.scene_shapes: Dict[str, Tuple[int, int]] = {}
         self.context_cache: Dict[str, SceneContextCache] = {}
@@ -247,13 +241,14 @@ class DarkVesselDataset(Dataset):
             vv_path = os.path.join(s_dir, "VV_dB.tif")
             self.sar_paths[sid] = {"VH": vh_path, "VV": vv_path}
 
-            # Inspect shape without keeping file descriptor open across worker processes
+            # inspect shape without keeping file descriptor open across worker processes
             with tifffile.TiffFile(vh_path) as tif:
                 self.scene_shapes[sid] = tif.series[0].shape
 
+            # gets the context maps for the current
             self.context_cache[sid] = SceneContextCache(sid, data_dir=data_dir)
 
-            # Pre-group targets for sub-millisecond spatial querying
+            # pre-group targets for sub-millisecond spatial querying
             sdf = self.df[self.df["scene_id"] == sid]
             if len(sdf) > 0:
                 rows = sdf["detect_scene_row"].values.astype(np.int32)
@@ -262,12 +257,12 @@ class DarkVesselDataset(Dataset):
                 is_v = np.where(sdf["is_vessel"] == False, 0, 1).astype(np.int32)
                 self.scene_targets[sid] = np.stack([rows, cols, is_v], axis=1)
             else:
-                self.scene_targets[sid] = np.empty((0, 3), dtype=np.int32)
+                self.scene_targets[sid] = np.empty((0, 3), dtype=np.int32) # literally an empty array
 
-        # Lazy memmap dictionary initialized per worker process
+        # lazy memmap dictionary initialized per worker process
         self._sar_memmaps: Optional[Dict[str, Dict[str, np.memmap]]] = None
 
-        # Build list of sample coordinates
+        # build list of sample coordinates
         self.samples = self._build_samples()
 
     def _get_sar_memmap(self, sid: str, pol: str) -> np.memmap:
@@ -285,14 +280,14 @@ class DarkVesselDataset(Dataset):
         samples = []
         half = PATCH_SIZE // 2
 
-        # 1. Positive Samples: centered on each ground-truth target
+        # positive Samples: centered on each ground-truth target
         for _, row in self.df.iterrows():
             sid = row["scene_id"]
             H, W = self.scene_shapes[sid]
             r_center = int(row["detect_scene_row"])
             c_center = int(row["detect_scene_column"])
 
-            # Ensure patch falls strictly within scene boundaries
+            # ensure patch falls strictly within scene boundaries
             r0 = max(0, min(H - PATCH_SIZE, r_center - half))
             c0 = max(0, min(W - PATCH_SIZE, c_center - half))
 
@@ -303,7 +298,10 @@ class DarkVesselDataset(Dataset):
                 "is_positive": True,
             })
 
-        # 2. Negative Samples (50:50 ratio): sampled across ocean and coastal regions
+        # negative Samples (50:50 ratio): sampled across ocean and coastal regions
+        # it takes random samples, the is_positive field is only used to know if we
+        # need to apply the jittering (the jittering is only needed on the first 
+        # part of the set)
         num_neg = len(samples)
         rng = np.random.RandomState(42 if not self.is_train else None)
         for _ in range(num_neg):
@@ -330,7 +328,7 @@ class DarkVesselDataset(Dataset):
 
         r0, c0 = sample["r0"], sample["c0"]
 
-        # Train-only jitter on positive patches: breaks the "target always at patch center"
+        # train-only jitter on positive patches: breaks the "target always at patch center"
         # shortcut. Amplitude PATCH_JITTER_PX keeps the centroid at >= 20 px from any border,
         # so the 3*sigma Gaussian target is never clipped.
         if self.is_train and sample["is_positive"]:
@@ -342,42 +340,44 @@ class DarkVesselDataset(Dataset):
         r1 = r0 + PATCH_SIZE
         c1 = c0 + PATCH_SIZE
 
-        # 1. Fast sub-window extraction via memory mapping
+        # fast sub-window extraction via memory mapping
         vh_mmap = self._get_sar_memmap(sid, "VH")
         vv_mmap = self._get_sar_memmap(sid, "VV")
 
         vh_raw = np.array(vh_mmap[r0:r1, c0:c1], dtype=np.float32)
         vv_raw = np.array(vv_mmap[r0:r1, c0:c1], dtype=np.float32)
 
-        # 2. Radiometric SAR normalization to [0.0, 1.0]
+        # radiometric SAR normalization to [0.0, 1.0]
         vh_norm = normalize_sar_db(vh_raw, VH_MIN_DB, VH_MAX_DB)
         vv_norm = normalize_sar_db(vv_raw, VV_MIN_DB, VV_MAX_DB)
 
-        # 3. Context patch extraction (bathymetry, distance-to-shore, wind-speed)
+        # context patch extraction (bathymetry, distance-to-shore, wind-speed)
         bathy_patch, dist_shore_patch, wind_patch = self.context_cache[sid].extract_context_patch(
             r0, r1, c0, c1, H_sar, W_sar
         )
 
-        # Assemble 5-channel input tensor: shape (5, 256, 256)
+        # assemble 5-channel input tensor: shape (5, 256, 256)
         x = np.stack([vh_norm, vv_norm, bathy_patch, dist_shore_patch, wind_patch], axis=0)
 
-        # 4. Target Heatmap generation: shape (2, 256, 256)
+        # target Heatmap generation: shape (2, 256, 256)
         target = np.zeros((NUM_CLASSES, PATCH_SIZE, PATCH_SIZE), dtype=np.float32)
 
+        # targets is a Nx3 matrix where column 0 
+        # is the y axis and the column 1 is the x axis
         targets = self.scene_targets[sid]
         if len(targets) > 0:
             mask = (
                 (targets[:, 0] >= r0) & (targets[:, 0] < r1) &
                 (targets[:, 1] >= c0) & (targets[:, 1] < c1)
             )
-            patch_targets = targets[mask]
+            patch_targets = targets[mask] # gets only the patch targets
             for r_t, c_t, is_v in patch_targets:
                 local_y = int(r_t - r0)
                 local_x = int(c_t - c0)
                 ch = 0 if is_v == 1 else 1
                 draw_gaussian_peak(target[ch], local_x, local_y, sigma=GAUSSIAN_RADIAL_SIGMA)
 
-        # 5. SAR-Safe equivariant geometric augmentations (training only)
+        # SAR-Safe equivariant geometric augmentations (training only)
         if self.is_train:
             # Random Horizontal Flip
             if np.random.rand() > 0.5:
@@ -396,9 +396,7 @@ class DarkVesselDataset(Dataset):
         return torch.from_numpy(x).float(), torch.from_numpy(target).float()
 
 
-# -----------------------------------------------------------------------------
-# 5. DataLoader Factory
-# -----------------------------------------------------------------------------
+# DataLoader Factory
 def get_dataloaders(
     batch_size: int = BATCH_SIZE,
     num_workers: int = NUM_WORKERS,
