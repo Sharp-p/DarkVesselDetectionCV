@@ -1,8 +1,8 @@
 # Dark Vessel Detection via Multimodal SAR & Context-Guided Cross-Attention (CGCAM)
 
-**Master's Course in Computer Vision (A.Y. 2025–2026)**
-**ALCOR Lab, Department of Computer, Control and Management Engineering (DIAG)**
-**Sapienza University of Rome**
+**Master's Course in Computer Vision (A.Y. 2025–2026)** \
+**Department of Computer, Control and Management Engineering (DIAG)**\
+**Sapienza University of Rome**\
 **Instructor:** Prof. Irene Amerini
 
 ---
